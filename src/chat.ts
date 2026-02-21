@@ -2,31 +2,31 @@
 /**
  * Interactive chat via Antigravity (Cloud Code Assist).
  *
- * Supports all available models (Gemini, Claude, GPT-OSS) through a
- * unified Cloud Code Assist proxy.
+ * Full retained-mode TUI built on pi-tui with OpenClaw-inspired styling.
  *
- * This script provides a full interactive chat experience:
- *
- *   1. Loads & validates saved OAuth tokens (auto-refreshes if expired).
- *   2. Fetches available models from the Cloud Code Assist API.
- *   3. Presents an interactive model picker with quota information.
- *   4. Enters a chat loop: prompt → stream response → repeat.
- *
- * Commands:
- *   /quit, /exit   — End the session.
- *   /model         — Switch to a different model.
- *   /clear         — Clear conversation history and start fresh.
- *   /history       — Show message count and cumulative token usage.
+ * The API layer (api.ts, oauth.ts, tokens.ts, models.ts, types.ts) is
+ * intentionally kept UI-agnostic so a future web frontend can reuse it.
  *
  * Usage:
  *   bun run chat
  */
 
-import * as p from "@clack/prompts";
-import color from "picocolors";
+import {
+  Container,
+  Loader,
+  type OverlayHandle,
+  ProcessTerminal,
+  type SelectItem,
+  SelectList,
+  Text,
+  TUI,
+} from "@mariozechner/pi-tui";
 import { sendMessage } from "./api.js";
 import { fetchAvailableModels } from "./models.js";
 import { getValidTokens } from "./tokens.js";
+import { ChatLog } from "./tui/chat-log.js";
+import { CustomEditor } from "./tui/custom-editor.js";
+import { editorTheme, theme } from "./tui/theme.js";
 import type { ChatMessage, ModelInfo, TokenData, TokenUsage } from "./types.js";
 
 // ── System prompt ────────────────────────────────────────────────────────────
@@ -75,171 +75,338 @@ function buildSystemPrompt(opts: {
   shell: string;
 }): string {
   return [
-    `You are an agentic AI coding assistant.`,
+    "You are an agentic AI coding assistant.",
     `Model: ${opts.displayName} (${opts.modelId}).`,
     `User environment: ${opts.distro}, desktop: ${opts.de}, shell: ${opts.shell}.`,
   ].join("\n");
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Thinking block handling ──────────────────────────────────────────────────
 
 /**
- * Format a remaining-quota fraction as a colored percentage string.
- * Green above 50%, yellow 20–50%, red below 20%.
+ * Regex-based inline thinking tag stripper with code-region awareness.
+ *
+ * Models like Claude may embed `<thinking>...</thinking>` in their text
+ * output. This strips those tags and returns what was inside them,
+ * while leaving tags inside code blocks/inline code untouched.
+ *
+ * Modeled after OpenClaw's `stripReasoningTagsFromText()`.
  */
-function formatQuota(fraction: number | undefined): string {
-  if (fraction === undefined) return color.dim("quota unknown");
-  const pct = Math.round(fraction * 100);
-  const label = `${pct}% remaining`;
-  if (pct > 50) return color.green(label);
-  if (pct > 20) return color.yellow(label);
-  return color.red(label);
+const QUICK_TAG_RE = /<\s*\/?(?:think(?:ing)?|thought|antthinking)\b/i;
+const THINKING_TAG_RE =
+  /<\s*(\/?)\s*(?:think(?:ing)?|thought|antthinking)\b[^<>]*>/gi;
+
+interface CodeRegion {
+  start: number;
+  end: number;
 }
 
-/**
- * Build select options for the model picker.
- */
-function buildModelOptions(
-  models: ModelInfo[],
-): Array<{ value: string; label: string; hint?: string }> {
-  return models.map((m) => ({
-    value: m.id,
-    label: m.displayName ?? m.id,
-    hint: formatQuota(m.remainingQuota),
-  }));
-}
+function findCodeRegions(text: string): CodeRegion[] {
+  const regions: CodeRegion[] = [];
 
-/** Check whether the user cancelled a prompt (Ctrl+C). */
-function assertNotCancelled<T>(value: T | symbol): asserts value is T {
-  if (p.isCancel(value)) {
-    p.cancel("Session cancelled.");
-    process.exit(0);
+  // Fenced code blocks
+  const fencedRe = /(^|\n)(```|~~~)[^\n]*\n[\s\S]*?(?:\n\2(?:\n|$)|$)/g;
+  for (const match of text.matchAll(fencedRe)) {
+    const prefix = match[1] ?? "";
+    const start = (match.index ?? 0) + prefix.length;
+    regions.push({ start, end: start + match[0].length - prefix.length });
   }
-}
 
-// ── Interactive flows ────────────────────────────────────────────────────────
-
-/**
- * Prompt the user to select a model from the available list.
- */
-async function selectModel(models: ModelInfo[]): Promise<string> {
-  const options = buildModelOptions(models);
-  const selection = await p.select({
-    message: "Select a model",
-    options,
-  });
-  assertNotCancelled(selection);
-  return selection as string;
-}
-
-/**
- * Fetch models with a spinner, returning the model list.
- */
-async function fetchModelsWithSpinner(tokens: TokenData): Promise<ModelInfo[]> {
-  const spin = p.spinner();
-  spin.start("Fetching available models…");
-
-  try {
-    const models = await fetchAvailableModels(tokens.access, tokens.projectId);
-    if (models.length === 0) {
-      spin.stop("No models available");
-      p.log.error(
-        "The API returned no available models. Your account may not have access.",
-      );
-      process.exit(1);
+  // Inline code
+  const inlineRe = /`+[^`]+`+/g;
+  for (const match of text.matchAll(inlineRe)) {
+    const start = match.index ?? 0;
+    const end = start + match[0].length;
+    const insideFenced = regions.some((r) => start >= r.start && end <= r.end);
+    if (!insideFenced) {
+      regions.push({ start, end });
     }
-    spin.stop(`Found ${models.length} available models`);
-    return models;
-  } catch (err) {
-    spin.stop("Failed to fetch models");
-    p.log.error(`Could not fetch models: ${(err as Error).message}`);
-    process.exit(1);
   }
+
+  regions.sort((a, b) => a.start - b.start);
+  return regions;
 }
 
-// ── Chat loop ────────────────────────────────────────────────────────────────
+function isInsideCode(pos: number, regions: CodeRegion[]): boolean {
+  return regions.some((r) => pos >= r.start && pos < r.end);
+}
 
-async function chatLoop(
-  tokens: TokenData,
-  modelId: string,
-  models: ModelInfo[],
-  env: { distro: string; de: string; shell: string },
-): Promise<void> {
-  const history: ChatMessage[] = [];
-  let totalUsage: TokenUsage = { inputTokens: 0, outputTokens: 0 };
-  let currentModel = modelId;
+/**
+ * Strip inline `<thinking>` tags from text, returning separated thinking
+ * and content. Tags inside code blocks/inline code are left alone.
+ */
+function stripInlineThinkingTags(raw: string): {
+  thinking: string;
+  content: string;
+} {
+  if (!raw || !QUICK_TAG_RE.test(raw)) {
+    return { thinking: "", content: raw };
+  }
 
-  const getDisplayName = (id: string) =>
-    models.find((m) => m.id === id)?.displayName ?? id;
+  const codeRegions = findCodeRegions(raw);
 
-  let systemPrompt = buildSystemPrompt({
-    modelId: currentModel,
-    displayName: getDisplayName(currentModel),
-    ...env,
-  });
+  THINKING_TAG_RE.lastIndex = 0;
+  let result = "";
+  let lastIndex = 0;
+  let inThinking = false;
+  const thinkingParts: string[] = [];
+  let currentThinkingStart = 0;
 
-  p.log.info(`Using model: ${color.cyan(currentModel)}`);
-  p.log.message(color.dim("Commands: /model /clear /history /quit"));
+  for (const match of raw.matchAll(THINKING_TAG_RE)) {
+    const idx = match.index ?? 0;
+    const isClose = match[1] === "/";
 
-  while (true) {
-    const input = await p.text({
-      message: color.cyan("You"),
-      placeholder: "Type your message…",
-    });
-    assertNotCancelled(input);
-
-    const message = (input as string).trim();
-    if (!message) continue;
-
-    // ── Slash commands ─────────────────────────────────────────────────────
-    if (message.startsWith("/")) {
-      const cmd = message.toLowerCase();
-
-      if (cmd === "/quit" || cmd === "/exit") {
-        break;
-      }
-
-      if (cmd === "/model") {
-        const newModel = await selectModel(models);
-        currentModel = newModel;
-        systemPrompt = buildSystemPrompt({
-          modelId: currentModel,
-          displayName: getDisplayName(currentModel),
-          ...env,
-        });
-        p.log.info(`Switched to: ${color.cyan(currentModel)}`);
-        continue;
-      }
-
-      if (cmd === "/clear") {
-        history.length = 0;
-        totalUsage = { inputTokens: 0, outputTokens: 0 };
-        p.log.info("Conversation cleared.");
-        continue;
-      }
-
-      if (cmd === "/history") {
-        p.log.info(
-          `Messages: ${history.length} | ` +
-            `Tokens: ${totalUsage.inputTokens} in / ${totalUsage.outputTokens} out`,
-        );
-        continue;
-      }
-
-      p.log.warn(`Unknown command: ${cmd}`);
+    if (isInsideCode(idx, codeRegions)) {
       continue;
     }
 
-    // ── Send message ───────────────────────────────────────────────────────
-    history.push({ role: "user", content: message });
+    if (!inThinking) {
+      result += raw.slice(lastIndex, idx);
+      if (!isClose) {
+        inThinking = true;
+        currentThinkingStart = idx + match[0].length;
+      }
+    } else if (isClose) {
+      thinkingParts.push(raw.slice(currentThinkingStart, idx).trim());
+      inThinking = false;
+    }
 
-    // Collect assistant response text as it streams.
-    let responseText = "";
-    const modelLabel = currentModel
-      .split("-")
-      .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-      .join(" ");
-    process.stdout.write(`\n${color.dim(modelLabel)} `);
+    lastIndex = idx + match[0].length;
+  }
+
+  if (inThinking) {
+    // Unclosed thinking tag — treat the rest as thinking
+    thinkingParts.push(raw.slice(currentThinkingStart).trim());
+  } else {
+    result += raw.slice(lastIndex);
+  }
+
+  return {
+    thinking: thinkingParts.join("\n").trim(),
+    content: result.trim(),
+  };
+}
+
+/**
+ * Compose thinking + content into a display string.
+ * When showThinking is true and thinking text exists, prepends
+ * `[thinking]\n{text}` above the content (matching OpenClaw style).
+ */
+function composeDisplayText(
+  thinking: string,
+  content: string,
+  showThinking: boolean,
+): string {
+  const parts: string[] = [];
+  if (showThinking && thinking) {
+    parts.push(`[thinking]\n${thinking}`);
+  }
+  if (content) {
+    parts.push(content);
+  }
+  return parts.join("\n\n").trim();
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function getDisplayName(models: ModelInfo[], id: string): string {
+  return models.find((m) => m.id === id)?.displayName ?? id;
+}
+
+function formatTokenCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
+function formatTokens(inputTokens: number, outputTokens: number): string {
+  return `${formatTokenCount(inputTokens)} in / ${formatTokenCount(outputTokens)} out`;
+}
+
+// ── Pre-TUI setup (console-based) ────────────────────────────────────────────
+
+async function loadAuth(): Promise<TokenData> {
+  const tokens = await getValidTokens();
+  if (!tokens) {
+    console.error("No valid tokens found. Run `bun run auth` first.");
+    process.exit(1);
+  }
+  console.log(`Authenticated as ${tokens.email ?? "(unknown)"}`);
+  return tokens;
+}
+
+async function loadModels(tokens: TokenData): Promise<ModelInfo[]> {
+  console.log("Fetching available models…");
+  const models = await fetchAvailableModels(tokens.access, tokens.projectId);
+  if (models.length === 0) {
+    console.error("No models available.");
+    process.exit(1);
+  }
+  console.log(`Found ${models.length} models.`);
+  return models;
+}
+
+// ── TUI ──────────────────────────────────────────────────────────────────────
+
+async function runTui(
+  tokens: TokenData,
+  models: ModelInfo[],
+  env: { distro: string; de: string; shell: string },
+): Promise<void> {
+  // ── State ────────────────────────────────────────────────────────────────
+  let currentModel = models[0]?.id ?? "";
+  let showThinking = true;
+  let lastCtrlCAt = 0;
+  const history: ChatMessage[] = [];
+  let totalUsage: TokenUsage = { inputTokens: 0, outputTokens: 0 };
+  let systemPrompt = buildSystemPrompt({
+    modelId: currentModel,
+    displayName: getDisplayName(models, currentModel),
+    ...env,
+  });
+  let isBusy = false;
+
+  // ── Layout ───────────────────────────────────────────────────────────────
+  const tui = new TUI(new ProcessTerminal());
+  const header = new Text("", 1, 0);
+  const chatLog = new ChatLog();
+  const statusContainer = new Container();
+  const footer = new Text("", 1, 0);
+  const editor = new CustomEditor(tui, editorTheme);
+
+  const root = new Container();
+  root.addChild(header);
+  root.addChild(chatLog);
+  root.addChild(statusContainer);
+  root.addChild(footer);
+  root.addChild(editor);
+
+  tui.addChild(root);
+  tui.setFocus(editor);
+
+  // ── Status helpers ───────────────────────────────────────────────────────
+  let statusText: Text | null = null;
+  let statusLoader: Loader | null = null;
+
+  const setStatusIdle = (text: string) => {
+    statusContainer.clear();
+    statusLoader?.stop();
+    statusLoader = null;
+    statusText = new Text(theme.dim(text), 1, 0);
+    statusContainer.addChild(statusText);
+    tui.requestRender();
+  };
+
+  const setStatusBusy = (label: string) => {
+    statusContainer.clear();
+    statusText = null;
+    statusLoader = new Loader(
+      tui,
+      (spinner) => theme.accent(spinner),
+      (text) => theme.bold(theme.accentSoft(text)),
+      label,
+    );
+    statusContainer.addChild(statusLoader);
+    tui.requestRender();
+  };
+
+  // ── Header / Footer ─────────────────────────────────────────────────────
+  const updateHeader = () => {
+    header.setText(
+      theme.header(`antigravity — ${getDisplayName(models, currentModel)}`),
+    );
+  };
+
+  const updateFooter = () => {
+    const modelLabel = getDisplayName(models, currentModel);
+    const tokens = formatTokens(
+      totalUsage.inputTokens,
+      totalUsage.outputTokens,
+    );
+    const thinkLabel = showThinking ? "on" : "off";
+    const parts = [modelLabel, `think ${thinkLabel}`, tokens];
+    footer.setText(theme.dim(parts.join(" | ")));
+  };
+
+  updateHeader();
+  updateFooter();
+  setStatusIdle("ready | /model /clear /thinking /quit");
+
+  // ── Model selector overlay ───────────────────────────────────────────────
+  const openModelSelector = () => {
+    const items: SelectItem[] = models.map((m) => ({
+      label: m.displayName ?? m.id,
+      value: m.id,
+      description:
+        m.remainingQuota !== undefined
+          ? `${Math.round(m.remainingQuota * 100)}% remaining`
+          : undefined,
+    }));
+
+    const list = new SelectList(items, 20, editorTheme.selectList);
+
+    let overlayHandle: OverlayHandle | undefined;
+
+    list.onSelect = (item) => {
+      currentModel = item.value as string;
+      systemPrompt = buildSystemPrompt({
+        modelId: currentModel,
+        displayName: getDisplayName(models, currentModel),
+        ...env,
+      });
+      updateHeader();
+      updateFooter();
+      chatLog.addSystem(`Switched to ${getDisplayName(models, currentModel)}`);
+      overlayHandle?.hide();
+      tui.setFocus(editor);
+      tui.requestRender();
+    };
+
+    list.onCancel = () => {
+      overlayHandle?.hide();
+      tui.setFocus(editor);
+      tui.requestRender();
+    };
+
+    overlayHandle = tui.showOverlay(list, {
+      width: "60%",
+      maxHeight: "60%",
+      anchor: "center",
+    });
+    tui.setFocus(list);
+  };
+
+  // ── Send message ─────────────────────────────────────────────────────────
+  const doSendMessage = async (text: string) => {
+    if (isBusy) return;
+    isBusy = true;
+
+    chatLog.addUser(text);
+    history.push({ role: "user", content: text });
+
+    // Show streaming indicator
+    setStatusBusy("streaming");
+
+    // Track thinking and content text separately during streaming
+    // (like OpenClaw's TuiStreamAssembler)
+    let structuredThinking = "";
+    let rawContent = "";
+
+    const refreshDisplay = () => {
+      // Combine structured thinking with any inline-tag thinking
+      const { thinking: inlineThinking, content: strippedContent } =
+        stripInlineThinkingTags(rawContent);
+      const allThinking = [structuredThinking, inlineThinking]
+        .filter(Boolean)
+        .join("\n");
+      const display = composeDisplayText(
+        allThinking,
+        strippedContent,
+        showThinking,
+      );
+      chatLog.updateAssistant(display || "…");
+      tui.requestRender();
+    };
 
     try {
       const usage = await sendMessage({
@@ -248,88 +415,182 @@ async function chatLoop(
         modelId: currentModel,
         messages: history,
         systemPrompt,
-        onText: (text) => {
-          responseText += text;
-          process.stdout.write(text);
+        onText: (chunk) => {
+          rawContent += chunk;
+          refreshDisplay();
+        },
+        onThinking: (chunk) => {
+          structuredThinking += chunk;
+          refreshDisplay();
         },
       });
 
-      process.stdout.write("\n\n");
+      // Finalize: compute final clean text
+      const { thinking: inlineThinking, content: strippedContent } =
+        stripInlineThinkingTags(rawContent);
+      const allThinking = [structuredThinking, inlineThinking]
+        .filter(Boolean)
+        .join("\n");
+      const finalDisplay = composeDisplayText(
+        allThinking,
+        strippedContent,
+        showThinking,
+      );
+      chatLog.finalizeAssistant(finalDisplay || "(no output)");
 
-      // Track the assistant response in history.
-      history.push({ role: "assistant", content: responseText });
+      // Store clean content in history (no thinking)
+      history.push({ role: "assistant", content: strippedContent });
 
-      // Accumulate usage.
+      // Update usage
       totalUsage.inputTokens += usage.inputTokens;
       totalUsage.outputTokens += usage.outputTokens;
-
-      p.log.message(
-        color.dim(
-          `tokens: ${usage.inputTokens} in / ${usage.outputTokens} out`,
-        ),
+      updateFooter();
+      setStatusIdle(
+        `${formatTokens(usage.inputTokens, usage.outputTokens)} | ready`,
       );
     } catch (err) {
-      process.stdout.write("\n");
-      p.log.error(`Request failed: ${(err as Error).message}`);
+      chatLog.dropAssistant();
+      history.pop(); // Remove failed user message
+      chatLog.addSystem(`Error: ${(err as Error).message}`);
 
-      // Remove the user message from history since it failed.
-      history.pop();
-
-      // Check if it's a token expiry error — try to refresh.
+      // Try token refresh on 401
       if ((err as Error).message.includes("401")) {
-        p.log.warn("Access token may have expired. Attempting refresh…");
+        chatLog.addSystem("Attempting token refresh…");
         const refreshed = await getValidTokens();
         if (refreshed) {
           tokens.access = refreshed.access;
           tokens.expires = refreshed.expires;
-          p.log.info("Token refreshed. Please try your message again.");
+          chatLog.addSystem("Token refreshed. Try again.");
         } else {
-          p.log.error(
-            "Token refresh failed. Run `bun run auth` to re-authenticate.",
-          );
-          break;
+          chatLog.addSystem("Refresh failed. Run `bun run auth`.");
         }
       }
+      setStatusIdle("error | ready");
     }
-  }
 
-  // ── Session summary ────────────────────────────────────────────────────────
-  p.outro(
-    `Session ended. ${history.filter((m) => m.role === "user").length} messages, ` +
-      `${totalUsage.inputTokens + totalUsage.outputTokens} total tokens.`,
-  );
+    isBusy = false;
+    tui.requestRender();
+  };
+
+  // ── Command handling ─────────────────────────────────────────────────────
+  const handleCommand = (input: string) => {
+    const cmd = input.toLowerCase().trim();
+
+    if (cmd === "/quit" || cmd === "/exit") {
+      tui.stop();
+      const total = totalUsage.inputTokens + totalUsage.outputTokens;
+      const msgs = history.filter((m) => m.role === "user").length;
+      console.log(
+        `\nSession ended. ${msgs} messages, ${formatTokenCount(total)} total tokens.`,
+      );
+      process.exit(0);
+    }
+
+    if (cmd === "/model") {
+      openModelSelector();
+      return;
+    }
+
+    if (cmd === "/clear") {
+      history.length = 0;
+      totalUsage = { inputTokens: 0, outputTokens: 0 };
+      chatLog.clearAll();
+      updateFooter();
+      chatLog.addSystem("Conversation cleared.");
+      tui.requestRender();
+      return;
+    }
+
+    if (cmd === "/thinking") {
+      showThinking = !showThinking;
+      updateFooter();
+      chatLog.addSystem(`Thinking display: ${showThinking ? "on" : "off"}`);
+      tui.requestRender();
+      return;
+    }
+
+    if (cmd === "/history") {
+      const msgs = history.filter((m) => m.role === "user").length;
+      const total = totalUsage.inputTokens + totalUsage.outputTokens;
+      chatLog.addSystem(
+        `${msgs} messages | ${formatTokens(totalUsage.inputTokens, totalUsage.outputTokens)} | ${formatTokenCount(total)} total`,
+      );
+      tui.requestRender();
+      return;
+    }
+
+    chatLog.addSystem(`Unknown command: ${cmd}`);
+    tui.requestRender();
+  };
+
+  // ── Editor wiring ────────────────────────────────────────────────────────
+  editor.onSubmit = (text: string) => {
+    const value = text.trim();
+    editor.setText("");
+    if (!value) return;
+
+    editor.addToHistory(value);
+
+    if (value.startsWith("/")) {
+      handleCommand(value);
+      return;
+    }
+
+    void doSendMessage(value);
+  };
+
+  editor.onCtrlC = () => {
+    if (editor.getText().trim().length > 0) {
+      editor.setText("");
+      setStatusIdle("cleared input | ready");
+      tui.requestRender();
+      return;
+    }
+    const now = Date.now();
+    if (now - lastCtrlCAt < 1000) {
+      tui.stop();
+      process.exit(0);
+    }
+    lastCtrlCAt = now;
+    setStatusIdle("press ctrl+c again to exit");
+    tui.requestRender();
+  };
+
+  editor.onCtrlD = () => {
+    tui.stop();
+    process.exit(0);
+  };
+
+  editor.onCtrlT = () => {
+    showThinking = !showThinking;
+    updateFooter();
+    chatLog.addSystem(`Thinking display: ${showThinking ? "on" : "off"}`);
+    tui.requestRender();
+  };
+
+  // ── Start ────────────────────────────────────────────────────────────────
+  tui.start();
+
+  // Show model selector on startup
+  openModelSelector();
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  p.intro(color.bgCyan(color.black(" Antigravity Chat ")));
+  console.log("⚡ Antigravity Chat\n");
 
-  // 1. Load tokens
-  const tokens = await getValidTokens();
-  if (!tokens) {
-    p.log.error("No valid tokens found. Run `bun run auth` first.");
-    p.outro("Authentication required.");
-    process.exit(1);
-  }
-
-  p.log.success(`Authenticated as ${color.cyan(tokens.email ?? "(unknown)")}`);
-  p.log.message(color.dim(`Project: ${tokens.projectId}`));
-
-  // 2. Detect user environment
+  const tokens = await loadAuth();
   const env = await detectEnvironment();
+  const models = await loadModels(tokens);
 
-  // 3. Fetch available models
-  const models = await fetchModelsWithSpinner(tokens);
+  // Clear console before entering TUI
+  console.clear();
 
-  // 4. Select initial model
-  const modelId = await selectModel(models);
-
-  // 5. Chat loop
-  await chatLoop(tokens, modelId, models, env);
+  await runTui(tokens, models, env);
 }
 
 main().catch((err) => {
-  p.log.error(`Fatal error: ${(err as Error).message}`);
+  console.error(`Fatal error: ${(err as Error).message}`);
   process.exit(1);
 });

@@ -22,7 +22,7 @@ interface StreamChunk {
     candidates?: Array<{
       content?: {
         role?: string;
-        parts?: Array<{ text?: string }>;
+        parts?: Array<{ text?: string; thought?: boolean }>;
       };
       finishReason?: string;
     }>;
@@ -52,9 +52,14 @@ function toContents(messages: ChatMessage[]) {
 
 // ── SSE stream reader ────────────────────────────────────────────────────────
 
+interface StreamCallbacks {
+  onText: (text: string) => void;
+  onThinking?: (text: string) => void;
+}
+
 async function readStream(
   body: ReadableStream<Uint8Array>,
-  onText: (text: string) => void,
+  callbacks: StreamCallbacks,
 ): Promise<TokenUsage> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -80,10 +85,16 @@ async function readStream(
         const resp = chunk.response;
         if (!resp) continue;
 
-        // Extract text deltas
+        // Extract text/thinking deltas from parts
         for (const cand of resp.candidates ?? []) {
           for (const part of cand.content?.parts ?? []) {
-            if (part.text) onText(part.text);
+            if (!part.text) continue;
+            if (part.thought && callbacks.onThinking) {
+              // Structured thinking block (Gemini models)
+              callbacks.onThinking(part.text);
+            } else {
+              callbacks.onText(part.text);
+            }
           }
         }
 
@@ -121,6 +132,12 @@ export interface SendMessageOptions {
   maxTokens?: number;
   /** Callback invoked with each text fragment. */
   onText: (text: string) => void;
+  /**
+   * Callback invoked with thinking/reasoning fragments.
+   * Gemini models emit structured thinking parts (`thought: true`).
+   * If not provided, thinking parts are routed to `onText`.
+   */
+  onThinking?: (text: string) => void;
 }
 
 /**
@@ -174,5 +191,8 @@ export async function sendMessage(
     throw new Error("API returned an empty response body.");
   }
 
-  return readStream(res.body, opts.onText);
+  return readStream(res.body, {
+    onText: opts.onText,
+    onThinking: opts.onThinking,
+  });
 }
