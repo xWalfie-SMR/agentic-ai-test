@@ -1,16 +1,17 @@
 /**
- * Provider layer — copied from OpenClaw's attempt.ts createAgentSession pattern.
+ * Provider layer — uses ModelRegistry.find() for model resolution
+ * (same as OpenClaw's resolveModel in pi-embedded-runner/model.ts).
  *
- * OpenClaw source: /opt/openclaw/src/agents/pi-embedded-runner/run/attempt.ts lines 575-586
- * Adapted for Waffle Maker by replacing auth/model variables.
+ * Session factory copied from OpenClaw's attempt.ts createAgentSession pattern.
  */
 
 import type { AgentTool } from "@mariozechner/pi-agent-core";
-import type { Model } from "@mariozechner/pi-ai";
+import type { Api, Model } from "@mariozechner/pi-ai";
 import {
   type AgentSession,
   AuthStorage,
   createAgentSession,
+  ModelRegistry,
   SessionManager,
   SettingsManager,
 } from "@mariozechner/pi-coding-agent";
@@ -18,21 +19,29 @@ import { CODE_ASSIST_BASE } from "./constants.js";
 import { loadTokens } from "./tokens.js";
 import type { ModelInfo } from "./types.js";
 
-// ── Model resolution (unchanged) ────────────────────────────────────────────
+// ── Model resolution (via ModelRegistry, same as OpenClaw) ──────────────────
 
-export function toModel(info: ModelInfo): Model<"google-gemini-cli"> {
+const PROVIDER = "google-antigravity";
+
+export function toModel(info: ModelInfo): Model<Api> {
+  const authStorage = AuthStorage.create();
+  const modelRegistry = new ModelRegistry(authStorage);
+  const found = modelRegistry.find(PROVIDER, info.id);
+  if (found) {
+    return found;
+  }
+  // Fallback for models not in the built-in registry
   const isReasoning =
     /think|reason/i.test(info.id) ||
     /think|reason/i.test(info.displayName ?? "");
   const isLargeContext = /gemini.*2\.5|claude.*opus|claude.*sonnet/i.test(
     info.id,
   );
-
   return {
     id: info.id,
     name: info.displayName ?? info.id,
     api: "google-gemini-cli",
-    provider: "google-gemini-cli",
+    provider: PROVIDER,
     baseUrl: CODE_ASSIST_BASE,
     reasoning: isReasoning,
     input: ["text", "image"],
@@ -44,27 +53,8 @@ export function toModel(info: ModelInfo): Model<"google-gemini-cli"> {
 
 // ── Session factory (copied from OpenClaw attempt.ts) ────────────────────────
 
-/**
- * Copied from OpenClaw's attempt.ts lines 575-586:
- *
- *   ({ session } = await createAgentSession({
- *     cwd: resolvedWorkspace,
- *     agentDir,
- *     authStorage: params.authStorage,
- *     modelRegistry: params.modelRegistry,
- *     model: params.model,
- *     thinkingLevel: mapThinkingLevel(params.thinkLevel),
- *     tools: builtInTools,
- *     customTools: allCustomTools,
- *     sessionManager,
- *     settingsManager,
- *   }));
- *
- * Adapted: we inject our OAuth token via AuthStorage.setRuntimeApiKey()
- * (same as OpenClaw's main.ts line 588: authStorage.setRuntimeApiKey(...))
- */
 export async function createSession(
-  model: Model<"google-gemini-cli">,
+  model: Model<Api>,
   tools: AgentTool[],
   systemPrompt: string,
   projectId: string,
@@ -72,31 +62,26 @@ export async function createSession(
   const tokens = await loadTokens();
   if (!tokens?.access) throw new Error("No OAuth token available");
 
-  // Same as OpenClaw main.ts: authStorage.setRuntimeApiKey(provider, apiKey)
   const authStorage = AuthStorage.create();
   authStorage.setRuntimeApiKey(
-    "google-gemini-cli",
+    PROVIDER,
     JSON.stringify({ token: tokens.access, projectId }),
   );
 
   const cwd = process.cwd();
-  // Same as OpenClaw attempt.ts: SettingsManager.create(cwd, agentDir)
   const settingsManager = SettingsManager.create(cwd);
-  // Same as OpenClaw attempt.ts: SessionManager.open(...) — we use inMemory
   const sessionManager = SessionManager.inMemory();
 
-  // Copied from OpenClaw attempt.ts lines 575-586
   const { session } = await createAgentSession({
     cwd,
     authStorage,
     model,
-    tools: [], // no built-in coding tools
-    customTools: tools, // our waffle maker tools
+    tools: [],
+    customTools: tools,
     sessionManager,
     settingsManager,
   });
 
-  // Same as OpenClaw attempt.ts line 587: applySystemPromptOverrideToSession
   session.agent.setSystemPrompt(systemPrompt);
 
   return session;

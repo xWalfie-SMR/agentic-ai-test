@@ -15,11 +15,13 @@ import type { AgentEvent } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, ToolCall } from "@mariozechner/pi-ai";
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
 import {
+  CombinedAutocompleteProvider,
   Container,
   Loader,
   ProcessTerminal,
   type SelectItem,
   SelectList,
+  type SlashCommand,
   Text,
   TUI,
 } from "@mariozechner/pi-tui";
@@ -307,6 +309,22 @@ async function runTui(
   const statusContainer = new Container();
   const footer = new Text("", 1, 0);
   const editor = new CustomEditor(tui, editorTheme);
+
+  // Slash command autocomplete (same pattern as OpenClaw tui.ts)
+  const slashCommands: SlashCommand[] = [
+    { name: "model", description: "Switch model" },
+    { name: "think", description: "Toggle thinking display" },
+    { name: "thinking", description: "Toggle thinking display" },
+    { name: "clear", description: "Clear conversation" },
+    { name: "new", description: "Start fresh session" },
+    { name: "history", description: "Show session stats" },
+    { name: "session", description: "Show session stats" },
+    { name: "help", description: "Show available commands" },
+    { name: "quit", description: "Exit" },
+  ];
+  editor.setAutocompleteProvider(
+    new CombinedAutocompleteProvider(slashCommands),
+  );
 
   const root = new Container();
   root.addChild(header);
