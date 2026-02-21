@@ -21,7 +21,6 @@ import {
   ProcessTerminal,
   type SelectItem,
   SelectList,
-  type SlashCommand,
   Text,
   TUI,
 } from "@mariozechner/pi-tui";
@@ -30,6 +29,7 @@ import { createSession, toModel } from "./provider.js";
 import { getValidTokens } from "./tokens.js";
 import { allTools, getToolSummaryLines } from "./tools/index.js";
 import { ChatLog } from "./tui/chat-log.js";
+import { getSlashCommands, helpText, parseCommand } from "./tui/commands.js";
 import { CustomEditor } from "./tui/custom-editor.js";
 import { editorTheme, theme } from "./tui/theme.js";
 import type { ModelInfo, TokenData } from "./types.js";
@@ -310,18 +310,8 @@ async function runTui(
   const footer = new Text("", 1, 0);
   const editor = new CustomEditor(tui, editorTheme);
 
-  // Slash command autocomplete (same pattern as OpenClaw tui.ts)
-  const slashCommands: SlashCommand[] = [
-    { name: "model", description: "Switch model" },
-    { name: "think", description: "Toggle thinking display" },
-    { name: "thinking", description: "Toggle thinking display" },
-    { name: "clear", description: "Clear conversation" },
-    { name: "new", description: "Start fresh session" },
-    { name: "history", description: "Show session stats" },
-    { name: "session", description: "Show session stats" },
-    { name: "help", description: "Show available commands" },
-    { name: "quit", description: "Exit" },
-  ];
+  // Slash command autocomplete (copied from OpenClaw tui.ts)
+  const slashCommands = getSlashCommands();
   editor.setAutocompleteProvider(
     new CombinedAutocompleteProvider(slashCommands),
   );
@@ -617,81 +607,76 @@ async function runTui(
   };
 
   // ── Command handling ─────────────────────────────────────────────────────
+  // Command handling (uses parseCommand from OpenClaw commands.ts)
   const handleCommand = (input: string) => {
-    const cmd = input.toLowerCase().trim();
+    const { name, args } = parseCommand(input);
+    if (!name) return;
 
-    if (cmd === "/quit" || cmd === "/exit") {
-      tui.stop();
-      const total = totalUsage.inputTokens + totalUsage.outputTokens;
-      console.log(`\nSession ended. ${formatTokenCount(total)} total tokens.`);
-      process.exit(0);
+    switch (name) {
+      case "help":
+        chatLog.addSystem(helpText());
+        break;
+      case "model":
+      case "models":
+        openModelSelector();
+        break;
+      case "think": {
+        if (!args) {
+          chatLog.addSystem("usage: /think <on|off>");
+          break;
+        }
+        const level = args.toLowerCase();
+        if (level === "on" || level === "off") {
+          showThinking = level === "on";
+          updateFooter();
+          chatLog.addSystem(`thinking set to ${level}`);
+        } else {
+          chatLog.addSystem("usage: /think <on|off>");
+        }
+        break;
+      }
+      case "new":
+      case "reset":
+        totalUsage = { inputTokens: 0, outputTokens: 0 };
+        chatLog.clearAll();
+        void rebuildAgent();
+        updateFooter();
+        chatLog.addSystem("session reset");
+        break;
+      case "abort":
+        if (!isBusy) {
+          chatLog.addSystem("nothing to abort");
+        } else {
+          chatLog.addSystem("aborting...");
+          // The abort is handled via the stream — set flag so next loop breaks
+          isBusy = false;
+        }
+        break;
+      case "settings": {
+        chatLog.addSystem(
+          [
+            "Settings:",
+            `  thinking: ${showThinking ? "on" : "off"}`,
+            `  model: ${currentModel}`,
+            `  tokens: ${formatTokens(totalUsage.inputTokens, totalUsage.outputTokens)}`,
+          ].join("\n"),
+        );
+        break;
+      }
+      case "exit":
+      case "quit":
+        tui.stop();
+        console.log(
+          `\nSession ended. ${formatTokenCount(totalUsage.inputTokens + totalUsage.outputTokens)} total tokens.`,
+        );
+        process.exit(0);
+        break;
+      default:
+        chatLog.addSystem(
+          `Unknown command: ${name}. Type /help for available commands.`,
+        );
+        break;
     }
-
-    if (cmd === "/model") {
-      openModelSelector();
-      return;
-    }
-
-    if (cmd === "/clear") {
-      totalUsage = { inputTokens: 0, outputTokens: 0 };
-      chatLog.clearAll();
-      void rebuildAgent(); // Fresh session = fresh conversation
-      updateFooter();
-      chatLog.addSystem("Conversation cleared.");
-      tui.requestRender();
-      return;
-    }
-
-    if (cmd === "/think" || cmd === "/thinking") {
-      showThinking = !showThinking;
-      updateFooter();
-      chatLog.addSystem(`Thinking display: ${showThinking ? "on" : "off"}`);
-      tui.requestRender();
-      return;
-    }
-
-    if (cmd === "/new") {
-      totalUsage = { inputTokens: 0, outputTokens: 0 };
-      chatLog.clearAll();
-      void rebuildAgent();
-      updateFooter();
-      chatLog.addSystem("New session started.");
-      tui.requestRender();
-      return;
-    }
-
-    if (cmd === "/history" || cmd === "/session") {
-      const msgs = session.agent.state.messages.filter(
-        (m) => m.role === "user",
-      ).length;
-      const total = totalUsage.inputTokens + totalUsage.outputTokens;
-      chatLog.addSystem(
-        `${msgs} messages | ${formatTokens(totalUsage.inputTokens, totalUsage.outputTokens)} | ${formatTokenCount(total)} total`,
-      );
-      tui.requestRender();
-      return;
-    }
-
-    if (cmd === "/help") {
-      chatLog.addSystem(
-        [
-          "Commands:",
-          "  /model     — switch model",
-          "  /think     — toggle thinking display",
-          "  /clear     — clear conversation",
-          "  /new       — start fresh session",
-          "  /history   — show session stats",
-          "  /quit      — exit",
-          "  /help      — show this list",
-        ].join("\n"),
-      );
-      tui.requestRender();
-      return;
-    }
-
-    chatLog.addSystem(
-      `Unknown command: ${cmd}. Type /help for available commands.`,
-    );
     tui.requestRender();
   };
 
