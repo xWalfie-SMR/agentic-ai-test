@@ -31,8 +31,6 @@ import {
 
 export { extractReadableContent } from "./web-fetch-utils.js";
 
-const EXTRACT_MODES = ["markdown", "text"] as const;
-
 const DEFAULT_FETCH_MAX_CHARS = 50_000;
 const DEFAULT_FETCH_MAX_RESPONSE_BYTES = 2_000_000;
 const DEFAULT_FETCH_MAX_REDIRECTS = 3;
@@ -48,13 +46,10 @@ const FETCH_CACHE = new Map<string, CacheEntry<Record<string, unknown>>>();
 const WebFetchSchema = Type.Object({
   url: Type.String({ description: "HTTP or HTTPS URL to fetch." }),
   extractMode: Type.Optional(
-    Type.Union(
-      EXTRACT_MODES.map((m) => Type.Literal(m)),
-      {
-        description: 'Extraction mode ("markdown" or "text").',
-        default: "markdown",
-      },
-    ),
+    Type.String({
+      description:
+        'Extraction mode: "markdown" or "text". Defaults to "markdown".',
+    }),
   ),
   maxChars: Type.Optional(
     Type.Number({
