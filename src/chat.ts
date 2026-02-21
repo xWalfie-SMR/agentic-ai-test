@@ -1,8 +1,9 @@
 #!/usr/bin/env bun
 /**
- * Interactive chat via Antigravity (Cloud Code Assist).
+ * Interactive chat via Waffle Maker (Cloud Code Assist).
  *
  * Full retained-mode TUI built on pi-tui with OpenClaw-inspired styling.
+ * Supports tool use (exec, web_search, web_fetch) via Gemini function calling.
  *
  * The API layer (api.ts, oauth.ts, tokens.ts, models.ts, types.ts) is
  * intentionally kept UI-agnostic so a future web frontend can reuse it.
@@ -24,12 +25,23 @@ import {
 import { sendMessage } from "./api.js";
 import { fetchAvailableModels } from "./models.js";
 import { getValidTokens } from "./tokens.js";
+import {
+  executeTool,
+  getToolDeclarations,
+  getToolSummaryLines,
+} from "./tools/index.js";
 import { ChatLog } from "./tui/chat-log.js";
 import { CustomEditor } from "./tui/custom-editor.js";
 import { editorTheme, theme } from "./tui/theme.js";
-import type { ChatMessage, ModelInfo, TokenData, TokenUsage } from "./types.js";
+import type {
+  ChatMessage,
+  FunctionCall,
+  ModelInfo,
+  TokenData,
+  TokenUsage,
+} from "./types.js";
 
-// ── System prompt ────────────────────────────────────────────────────────────
+// ── System prompt (ported from OpenClaw) ─────────────────────────────────────
 
 /** Run a shell command and return trimmed stdout (empty string on failure). */
 async function shellExec(cmd: string): Promise<string> {
@@ -50,12 +62,14 @@ async function detectEnvironment(): Promise<{
   distro: string;
   de: string;
   shell: string;
+  hostname: string;
 }> {
-  const [distro, shell] = await Promise.all([
+  const [distro, shell, hostname] = await Promise.all([
     shellExec(
       "cat /etc/os-release 2>/dev/null | grep '^PRETTY_NAME=' | cut -d= -f2- | tr -d '\"'",
     ),
     shellExec("basename $SHELL"),
+    shellExec("hostname"),
   ]);
   const de =
     process.env.XDG_CURRENT_DESKTOP || process.env.DESKTOP_SESSION || "unknown";
@@ -63,22 +77,53 @@ async function detectEnvironment(): Promise<{
     distro: distro || "Unknown Linux",
     de: de || "unknown",
     shell: shell || "bash",
+    hostname: hostname || "localhost",
   };
 }
 
-/** Build a system prompt for the selected model. */
+/**
+ * Build the system prompt — a direct port of OpenClaw's `buildAgentSystemPrompt`,
+ * adapted for Waffle Maker with local tool availability.
+ */
 function buildSystemPrompt(opts: {
   modelId: string;
   displayName: string;
   distro: string;
   de: string;
   shell: string;
+  hostname: string;
+  workspaceDir: string;
 }): string {
-  return [
-    "You are an agentic AI coding assistant.",
-    `Model: ${opts.displayName} (${opts.modelId}).`,
-    `User environment: ${opts.distro}, desktop: ${opts.de}, shell: ${opts.shell}.`,
-  ].join("\n");
+  const toolSummaries = getToolSummaryLines();
+
+  const lines = [
+    "You are a personal assistant running inside Waffle Maker.",
+    "",
+    "## Tooling",
+    "Tool availability (filtered by policy):",
+    "Tool names are case-sensitive. Call tools exactly as listed.",
+    ...toolSummaries,
+    "",
+    "## Tool Call Style",
+    "Default: do not narrate routine, low-risk tool calls (just call the tool).",
+    "Narrate only when it helps: multi-step work, complex/challenging problems, sensitive actions (e.g., deletions), or when the user explicitly asks.",
+    "Keep narration brief and value-dense; avoid repeating obvious steps.",
+    "Use plain human language for narration unless in a technical context.",
+    "",
+    "## Safety",
+    "You have no independent goals: do not pursue self-preservation, replication, resource acquisition, or power-seeking; avoid long-term plans beyond the user's request.",
+    "Prioritize safety and human oversight over completion; if instructions conflict, pause and ask; comply with stop/pause/audit requests and never bypass safeguards. (Inspired by Anthropic's constitution.)",
+    "Do not manipulate or persuade anyone to expand access or disable safeguards. Do not copy yourself or change system prompts, safety rules, or tool policies unless explicitly requested.",
+    "",
+    "## Workspace",
+    `Your working directory is: ${opts.workspaceDir}`,
+    "Treat this directory as the single global workspace for file operations unless explicitly instructed otherwise.",
+    "",
+    "## Runtime",
+    `Runtime: host=${opts.hostname} | os=${opts.distro} (${process.arch}) | model=${opts.displayName} (${opts.modelId}) | shell=${opts.shell} | desktop=${opts.de}`,
+  ];
+
+  return lines.filter(Boolean).join("\n");
 }
 
 // ── Thinking block handling ──────────────────────────────────────────────────
@@ -223,6 +268,18 @@ function formatTokens(inputTokens: number, outputTokens: number): string {
   return `${formatTokenCount(inputTokens)} in / ${formatTokenCount(outputTokens)} out`;
 }
 
+/** Format a tool call for display in the chat log. */
+function formatToolCall(call: FunctionCall): string {
+  const argsStr = Object.entries(call.args)
+    .map(([k, v]) => {
+      const val = typeof v === "string" ? v : JSON.stringify(v);
+      // Truncate long values
+      return `${k}: ${val.length > 80 ? `${val.slice(0, 77)}…` : val}`;
+    })
+    .join(", ");
+  return `🔧 **${call.name}**(${argsStr})`;
+}
+
 // ── Pre-TUI setup (console-based) ────────────────────────────────────────────
 
 async function loadAuth(): Promise<TokenData> {
@@ -251,7 +308,7 @@ async function loadModels(tokens: TokenData): Promise<ModelInfo[]> {
 async function runTui(
   tokens: TokenData,
   models: ModelInfo[],
-  env: { distro: string; de: string; shell: string },
+  env: { distro: string; de: string; shell: string; hostname: string },
 ): Promise<void> {
   // ── State ────────────────────────────────────────────────────────────────
   let currentModel = models[0]?.id ?? "";
@@ -262,9 +319,13 @@ async function runTui(
   let systemPrompt = buildSystemPrompt({
     modelId: currentModel,
     displayName: getDisplayName(models, currentModel),
+    workspaceDir: process.cwd(),
     ...env,
   });
   let isBusy = false;
+
+  // Tool declarations for Gemini
+  const toolDeclarations = getToolDeclarations();
 
   // ── Layout ───────────────────────────────────────────────────────────────
   const tui = new TUI(new ProcessTerminal());
@@ -313,7 +374,7 @@ async function runTui(
   // ── Header / Footer ─────────────────────────────────────────────────────
   const updateHeader = () => {
     header.setText(
-      theme.header(`antigravity — ${getDisplayName(models, currentModel)}`),
+      theme.header(`🧇 waffle maker — ${getDisplayName(models, currentModel)}`),
     );
   };
 
@@ -352,6 +413,7 @@ async function runTui(
       systemPrompt = buildSystemPrompt({
         modelId: currentModel,
         displayName: getDisplayName(models, currentModel),
+        workspaceDir: process.cwd(),
         ...env,
       });
       updateHeader();
@@ -376,7 +438,7 @@ async function runTui(
     tui.setFocus(list);
   };
 
-  // ── Send message ─────────────────────────────────────────────────────────
+  // ── Send message (with tool calling loop) ───────────────────────────────
   const doSendMessage = async (text: string) => {
     if (isBusy) return;
     isBusy = true;
@@ -387,85 +449,149 @@ async function runTui(
     // Show streaming indicator
     setStatusBusy("streaming");
 
-    // Track thinking and content text separately during streaming
-    // (like OpenClaw's TuiStreamAssembler)
-    let structuredThinking = "";
-    let rawContent = "";
+    // Agentic tool-calling loop: keep going until the model responds with text
+    let loopCount = 0;
+    const MAX_TOOL_LOOPS = 15;
 
-    const refreshDisplay = () => {
-      // Combine structured thinking with any inline-tag thinking
-      const { thinking: inlineThinking, content: strippedContent } =
-        stripInlineThinkingTags(rawContent);
-      const allThinking = [structuredThinking, inlineThinking]
-        .filter(Boolean)
-        .join("\n");
-      const display = composeDisplayText(
-        allThinking,
-        strippedContent,
-        showThinking,
-      );
-      chatLog.updateAssistant(display || "…");
-      tui.requestRender();
-    };
+    while (loopCount < MAX_TOOL_LOOPS) {
+      loopCount++;
 
-    try {
-      const usage = await sendMessage({
-        accessToken: tokens.access,
-        projectId: tokens.projectId,
-        modelId: currentModel,
-        messages: history,
-        systemPrompt,
-        onText: (chunk) => {
-          rawContent += chunk;
-          refreshDisplay();
-        },
-        onThinking: (chunk) => {
-          structuredThinking += chunk;
-          refreshDisplay();
-        },
-      });
+      // Track thinking and content text separately during streaming
+      let structuredThinking = "";
+      let rawContent = "";
 
-      // Finalize: compute final clean text
-      const { thinking: inlineThinking, content: strippedContent } =
-        stripInlineThinkingTags(rawContent);
-      const allThinking = [structuredThinking, inlineThinking]
-        .filter(Boolean)
-        .join("\n");
-      const finalDisplay = composeDisplayText(
-        allThinking,
-        strippedContent,
-        showThinking,
-      );
-      chatLog.finalizeAssistant(finalDisplay || "(no output)");
+      const refreshDisplay = () => {
+        const { thinking: inlineThinking, content: strippedContent } =
+          stripInlineThinkingTags(rawContent);
+        const allThinking = [structuredThinking, inlineThinking]
+          .filter(Boolean)
+          .join("\n");
+        const display = composeDisplayText(
+          allThinking,
+          strippedContent,
+          showThinking,
+        );
+        chatLog.updateAssistant(display || "…");
+        tui.requestRender();
+      };
 
-      // Store clean content in history (no thinking)
-      history.push({ role: "assistant", content: strippedContent });
+      try {
+        const result = await sendMessage({
+          accessToken: tokens.access,
+          projectId: tokens.projectId,
+          modelId: currentModel,
+          messages: history,
+          systemPrompt,
+          tools: toolDeclarations,
+          onText: (chunk) => {
+            rawContent += chunk;
+            refreshDisplay();
+          },
+          onThinking: (chunk) => {
+            structuredThinking += chunk;
+            refreshDisplay();
+          },
+          onFunctionCall: () => {},
+        });
 
-      // Update usage
-      totalUsage.inputTokens += usage.inputTokens;
-      totalUsage.outputTokens += usage.outputTokens;
-      updateFooter();
-      setStatusIdle(
-        `${formatTokens(usage.inputTokens, usage.outputTokens)} | ready`,
-      );
-    } catch (err) {
-      chatLog.dropAssistant();
-      history.pop(); // Remove failed user message
-      chatLog.addSystem(`Error: ${(err as Error).message}`);
+        // Accumulate token usage
+        totalUsage.inputTokens += result.usage.inputTokens;
+        totalUsage.outputTokens += result.usage.outputTokens;
+        updateFooter();
 
-      // Try token refresh on 401
-      if ((err as Error).message.includes("401")) {
-        chatLog.addSystem("Attempting token refresh…");
-        const refreshed = await getValidTokens();
-        if (refreshed) {
-          tokens.access = refreshed.access;
-          tokens.expires = refreshed.expires;
-          chatLog.addSystem("Token refreshed. Try again.");
-        } else {
-          chatLog.addSystem("Refresh failed. Run `bun run auth`.");
+        // Does the model want to call a tool?
+        if (result.functionCall) {
+          const call = result.functionCall;
+
+          // Show the tool call in the chat log
+          chatLog.finalizeAssistant(formatToolCall(call));
+
+          // Push the function call into history
+          history.push({
+            role: "function_call",
+            content: "",
+            functionCall: call,
+          });
+
+          // Execute the tool
+          setStatusBusy(`running ${call.name}…`);
+          const toolResult = await executeTool(call.name, call.args);
+
+          // Show result preview in chat
+          const preview =
+            toolResult.output.length > 500
+              ? `${toolResult.output.slice(0, 497)}…`
+              : toolResult.output;
+          chatLog.addSystem(
+            `${toolResult.error ? "⚠️" : "✅"} ${call.name}: ${preview}`,
+          );
+          tui.requestRender();
+
+          // Push the function response into history
+          history.push({
+            role: "function_response",
+            content: "",
+            functionResponse: {
+              name: call.name,
+              response: {
+                output: toolResult.output,
+                ...(toolResult.error ? { error: true } : {}),
+              },
+            },
+          });
+
+          // Continue the loop — model will process the tool result
+          setStatusBusy("streaming");
+          continue;
         }
+
+        // No tool call — model responded with text. Finalize.
+        const { thinking: inlineThinking, content: strippedContent } =
+          stripInlineThinkingTags(rawContent);
+        const allThinking = [structuredThinking, inlineThinking]
+          .filter(Boolean)
+          .join("\n");
+        const finalDisplay = composeDisplayText(
+          allThinking,
+          strippedContent,
+          showThinking,
+        );
+        chatLog.finalizeAssistant(finalDisplay || "(no output)");
+
+        // Store clean content in history (no thinking)
+        history.push({ role: "assistant", content: strippedContent });
+
+        setStatusIdle(
+          `${formatTokens(result.usage.inputTokens, result.usage.outputTokens)} | ready`,
+        );
+        break; // Done — exit the loop
+      } catch (err) {
+        chatLog.dropAssistant();
+        if (loopCount === 1) {
+          history.pop(); // Remove failed user message
+        }
+        chatLog.addSystem(`Error: ${(err as Error).message}`);
+
+        // Try token refresh on 401
+        if ((err as Error).message.includes("401")) {
+          chatLog.addSystem("Attempting token refresh…");
+          const refreshed = await getValidTokens();
+          if (refreshed) {
+            tokens.access = refreshed.access;
+            tokens.expires = refreshed.expires;
+            chatLog.addSystem("Token refreshed. Try again.");
+          } else {
+            chatLog.addSystem("Refresh failed. Run `bun run auth`.");
+          }
+        }
+        setStatusIdle("error | ready");
+        break;
       }
-      setStatusIdle("error | ready");
+    }
+
+    if (loopCount >= MAX_TOOL_LOOPS) {
+      chatLog.addSystem("⚠️ Tool loop limit reached (max 15 calls per turn).");
+      setStatusIdle("tool limit | ready");
     }
 
     isBusy = false;
@@ -578,7 +704,7 @@ async function runTui(
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  console.log("⚡ Antigravity Chat\n");
+  console.log("🧇 Waffle Maker\n");
 
   const tokens = await loadAuth();
   const env = await detectEnvironment();

@@ -1,18 +1,20 @@
 /**
- * Antigravity Cloud Code Assist API client.
+ * Waffle Maker Cloud Code Assist API client.
  *
  * All models (Gemini, Claude, GPT-OSS) are accessed through the same
  * Cloud Code Assist proxy:
  *
  *   Endpoint:  POST {BASE_URL}/v1internal:streamGenerateContent?alt=sse
- *   Body:      { model, project, request: { contents, generationConfig } }
+ *   Body:      { model, project, request: { contents, generationConfig, tools } }
  *   Response:  SSE data lines with { response: { candidates, usageMetadata } }
  *
  * The `request` field wraps a standard Gemini generateContent payload.
+ * Function calling is supported via `tools` with `functionDeclarations`.
  */
 
 import { CODE_ASSIST_BASE } from "./constants.js";
-import type { ChatMessage, TokenUsage } from "./types.js";
+import type { GeminiFunctionDeclaration } from "./tools/types.js";
+import type { ChatMessage, FunctionCall, TokenUsage } from "./types.js";
 
 // ── Internal types ───────────────────────────────────────────────────────────
 
@@ -22,7 +24,14 @@ interface StreamChunk {
     candidates?: Array<{
       content?: {
         role?: string;
-        parts?: Array<{ text?: string; thought?: boolean }>;
+        parts?: Array<{
+          text?: string;
+          thought?: boolean;
+          functionCall?: {
+            name: string;
+            args: Record<string, unknown>;
+          };
+        }>;
       };
       finishReason?: string;
     }>;
@@ -42,12 +51,42 @@ interface StreamChunk {
  * Convert ChatMessage[] → Gemini `contents` format.
  *
  * Gemini uses `model` for assistant messages, `user` for user messages.
+ * Function call and response messages are serialized as model/user parts
+ * with functionCall / functionResponse part types.
  */
 function toContents(messages: ChatMessage[]) {
-  return messages.map((msg) => ({
-    role: msg.role === "assistant" ? "model" : "user",
-    parts: [{ text: msg.content }],
-  }));
+  return messages.map((msg) => {
+    if (msg.role === "function_call" && msg.functionCall) {
+      return {
+        role: "model",
+        parts: [
+          {
+            functionCall: {
+              name: msg.functionCall.name,
+              args: msg.functionCall.args,
+            },
+          },
+        ],
+      };
+    }
+    if (msg.role === "function_response" && msg.functionResponse) {
+      return {
+        role: "user",
+        parts: [
+          {
+            functionResponse: {
+              name: msg.functionResponse.name,
+              response: msg.functionResponse.response,
+            },
+          },
+        ],
+      };
+    }
+    return {
+      role: msg.role === "assistant" ? "model" : "user",
+      parts: [{ text: msg.content }],
+    };
+  });
 }
 
 // ── SSE stream reader ────────────────────────────────────────────────────────
@@ -55,17 +94,26 @@ function toContents(messages: ChatMessage[]) {
 interface StreamCallbacks {
   onText: (text: string) => void;
   onThinking?: (text: string) => void;
+  onFunctionCall?: (call: FunctionCall) => void;
+}
+
+/** Result of reading a stream — may end with text or a function call. */
+export interface StreamResult {
+  usage: TokenUsage;
+  /** If the model wants to call a function, this will be set. */
+  functionCall?: FunctionCall;
 }
 
 async function readStream(
   body: ReadableStream<Uint8Array>,
   callbacks: StreamCallbacks,
-): Promise<TokenUsage> {
+): Promise<StreamResult> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   let inputTokens = 0;
   let outputTokens = 0;
+  let pendingFunctionCall: FunctionCall | undefined;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -85,9 +133,20 @@ async function readStream(
         const resp = chunk.response;
         if (!resp) continue;
 
-        // Extract text/thinking deltas from parts
+        // Extract text/thinking/functionCall deltas from parts
         for (const cand of resp.candidates ?? []) {
           for (const part of cand.content?.parts ?? []) {
+            // Function call
+            if (part.functionCall) {
+              pendingFunctionCall = {
+                name: part.functionCall.name,
+                args: part.functionCall.args,
+              };
+              callbacks.onFunctionCall?.(pendingFunctionCall);
+              continue;
+            }
+
+            // Text
             if (!part.text) continue;
             if (part.thought && callbacks.onThinking) {
               // Structured thinking block (Gemini models)
@@ -112,7 +171,10 @@ async function readStream(
     }
   }
 
-  return { inputTokens, outputTokens };
+  return {
+    usage: { inputTokens, outputTokens },
+    functionCall: pendingFunctionCall,
+  };
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -128,8 +190,10 @@ export interface SendMessageOptions {
   messages: ChatMessage[];
   /** Optional system prompt (sent as systemInstruction). */
   systemPrompt?: string;
-  /** Maximum output tokens. Defaults to 8192. */
+  /** Maximum output tokens. Defaults to 16384. */
   maxTokens?: number;
+  /** Gemini function declarations for tool use. */
+  tools?: GeminiFunctionDeclaration[];
   /** Callback invoked with each text fragment. */
   onText: (text: string) => void;
   /**
@@ -138,6 +202,8 @@ export interface SendMessageOptions {
    * If not provided, thinking parts are routed to `onText`.
    */
   onThinking?: (text: string) => void;
+  /** Callback invoked when the model wants to call a function. */
+  onFunctionCall?: (call: FunctionCall) => void;
 }
 
 /**
@@ -149,13 +215,13 @@ export interface SendMessageOptions {
  */
 export async function sendMessage(
   opts: SendMessageOptions,
-): Promise<TokenUsage> {
+): Promise<StreamResult> {
   const url = `${CODE_ASSIST_BASE}/v1internal:streamGenerateContent?alt=sse`;
 
   const request: Record<string, unknown> = {
     contents: toContents(opts.messages),
     generationConfig: {
-      maxOutputTokens: opts.maxTokens ?? 8192,
+      maxOutputTokens: opts.maxTokens ?? 16384,
     },
   };
 
@@ -163,6 +229,15 @@ export async function sendMessage(
     request.systemInstruction = {
       parts: [{ text: opts.systemPrompt }],
     };
+  }
+
+  // Add tool declarations
+  if (opts.tools && opts.tools.length > 0) {
+    request.tools = [
+      {
+        functionDeclarations: opts.tools,
+      },
+    ];
   }
 
   const body = {
@@ -176,7 +251,7 @@ export async function sendMessage(
     headers: {
       Authorization: `Bearer ${opts.accessToken}`,
       "Content-Type": "application/json",
-      "User-Agent": "antigravity",
+      "User-Agent": "waffle-maker",
       "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
     },
     body: JSON.stringify(body),
@@ -194,5 +269,6 @@ export async function sendMessage(
   return readStream(res.body, {
     onText: opts.onText,
     onThinking: opts.onThinking,
+    onFunctionCall: opts.onFunctionCall,
   });
 }
