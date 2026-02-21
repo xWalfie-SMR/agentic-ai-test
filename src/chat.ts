@@ -521,6 +521,29 @@ async function runTui(
           structuredThinking = "";
           break;
         }
+        case "agent_end": {
+          // Check for errors in the final messages
+          const msgs = event.messages ?? [];
+          for (const m of msgs) {
+            if (
+              "errorMessage" in m &&
+              (m as Record<string, unknown>).errorMessage
+            ) {
+              const errMsg = (m as Record<string, unknown>)
+                .errorMessage as string;
+              chatLog.addSystem(`Agent error: ${errMsg}`);
+            }
+          }
+          break;
+        }
+        default: {
+          // Debug: log unhandled event types to stderr
+          const evType = (event as { type: string }).type;
+          if (evType !== "agent_start") {
+            process.stderr.write(`[debug] event: ${evType}\n`);
+          }
+          break;
+        }
       }
     });
 
