@@ -1,11 +1,11 @@
 /**
  * exec tool — run shell commands.
  *
- * Executes commands via the user's default shell with stdout/stderr
- * capture and timeout support.
+ * Returns an AgentTool compatible with pi-agent-core.
  */
 
-import type { Tool, ToolResult } from "./types.js";
+import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
+import { Type } from "@mariozechner/pi-ai";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_OUTPUT_CHARS = 50_000;
@@ -16,44 +16,49 @@ function truncateMiddle(text: string, max: number): string {
   return `${text.slice(0, half)}\n\n... (${text.length - max} chars truncated) ...\n\n${text.slice(-half)}`;
 }
 
-export const execTool: Tool = {
+const ExecParams = Type.Object({
+  command: Type.String({ description: "The shell command to execute." }),
+  workdir: Type.Optional(
+    Type.String({
+      description:
+        "Working directory for the command. Defaults to the workspace root.",
+    }),
+  ),
+  timeout: Type.Optional(
+    Type.Number({
+      description:
+        "Timeout in seconds (default: 30). The command is killed if it exceeds this.",
+      minimum: 1,
+      maximum: 300,
+    }),
+  ),
+});
+
+export const execTool: AgentTool<typeof ExecParams> = {
   name: "exec",
+  label: "Run Command",
   description:
     "Run a shell command. Returns stdout, stderr, and exit code. " +
     "Use for file operations, building, testing, git, package management, etc.",
-  parameters: {
-    type: "object",
-    properties: {
-      command: {
-        type: "string",
-        description: "The shell command to execute.",
-      },
-      workdir: {
-        type: "string",
-        description:
-          "Working directory for the command. Defaults to the workspace root.",
-      },
-      timeout: {
-        type: "number",
-        description:
-          "Timeout in seconds (default: 30). The command is killed if it exceeds this.",
-        minimum: 1,
-        maximum: 300,
-      },
-    },
-    required: ["command"],
-  },
+  parameters: ExecParams,
 
-  async execute(args: Record<string, unknown>): Promise<ToolResult> {
-    const command = String(args.command ?? "");
-    if (!command.trim()) {
-      return { output: "Error: empty command.", error: true };
+  async execute(
+    _toolCallId: string,
+    params: { command: string; workdir?: string; timeout?: number },
+    _signal?: AbortSignal,
+  ): Promise<AgentToolResult<unknown>> {
+    const command = String(params.command ?? "").trim();
+    if (!command) {
+      return {
+        content: [{ type: "text", text: "Error: empty command." }],
+        details: { error: true },
+      };
     }
 
-    const workdir = args.workdir ? String(args.workdir) : process.cwd();
+    const workdir = params.workdir ?? process.cwd();
     const timeoutMs =
-      typeof args.timeout === "number"
-        ? Math.min(args.timeout * 1000, 300_000)
+      typeof params.timeout === "number"
+        ? Math.min(params.timeout * 1000, 300_000)
         : DEFAULT_TIMEOUT_MS;
 
     const start = Date.now();
@@ -67,7 +72,6 @@ export const execTool: Tool = {
         env: { ...process.env, TERM: "dumb" },
       });
 
-      // Timeout handling
       const timer = setTimeout(() => {
         killed = true;
         proc.kill();
@@ -94,18 +98,21 @@ export const execTool: Tool = {
       if (killed) {
         parts.push(`(killed: timeout after ${Math.round(timeoutMs / 1000)}s)`);
       }
-
-      const status = `Exit code: ${exitCode} | ${tookMs}ms`;
-      parts.push(status);
+      parts.push(`Exit code: ${exitCode} | ${tookMs}ms`);
 
       return {
-        output: parts.join("\n"),
-        error: exitCode !== 0,
+        content: [{ type: "text", text: parts.join("\n") }],
+        details: { exitCode, killed },
       };
     } catch (err) {
       return {
-        output: `Error executing command: ${(err as Error).message}`,
-        error: true,
+        content: [
+          {
+            type: "text",
+            text: `Error executing command: ${(err as Error).message}`,
+          },
+        ],
+        details: { error: true },
       };
     }
   },

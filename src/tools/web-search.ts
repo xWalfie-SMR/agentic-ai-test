@@ -1,13 +1,12 @@
 /**
  * web_search tool — search the web.
  *
- * Uses Serper.dev (free tier: 2,500 Google searches, no credit card).
- * Set SERPER_API_KEY env var to enable.
- * Falls back to DuckDuckGo Instant Answer API (no key needed) when
- * Serper is not configured.
+ * Uses Serper.dev when SERPER_API_KEY is set, otherwise falls back
+ * to DuckDuckGo Instant Answer API.
  */
 
-import type { Tool, ToolResult } from "./types.js";
+import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
+import { Type } from "@mariozechner/pi-ai";
 
 const SERPER_ENDPOINT = "https://google.serper.dev/search";
 const DDG_ENDPOINT = "https://api.duckduckgo.com/";
@@ -23,15 +22,8 @@ interface SerperResult {
 
 interface SerperResponse {
   organic?: SerperResult[];
-  answerBox?: {
-    title?: string;
-    answer?: string;
-    snippet?: string;
-  };
-  knowledgeGraph?: {
-    title?: string;
-    description?: string;
-  };
+  answerBox?: { title?: string; answer?: string; snippet?: string };
+  knowledgeGraph?: { title?: string; description?: string };
 }
 
 interface DdgResponse {
@@ -39,65 +31,49 @@ interface DdgResponse {
   AbstractSource?: string;
   AbstractURL?: string;
   Heading?: string;
-  RelatedTopics?: Array<{
-    Text?: string;
-    FirstURL?: string;
-  }>;
+  RelatedTopics?: Array<{ Text?: string; FirstURL?: string }>;
 }
 
 async function searchSerper(
   query: string,
   apiKey: string,
   count: number,
-): Promise<ToolResult> {
+): Promise<string> {
   const res = await fetch(SERPER_ENDPOINT, {
     method: "POST",
-    headers: {
-      "X-API-KEY": apiKey,
-      "Content-Type": "application/json",
-    },
+    headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
     body: JSON.stringify({ q: query, num: count }),
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
-
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
-    return {
-      output: `Serper API error (${res.status}): ${detail || res.statusText}`,
-      error: true,
-    };
+    throw new Error(
+      `Serper API error (${res.status}): ${detail || res.statusText}`,
+    );
   }
-
   const data = (await res.json()) as SerperResponse;
   const parts: string[] = [`Web search results for: "${query}"\n`];
-
-  // Answer box
   if (data.answerBox?.answer || data.answerBox?.snippet) {
     parts.push(
       `**Answer:** ${data.answerBox.answer || data.answerBox.snippet}\n`,
     );
   }
-
-  // Knowledge graph
   if (data.knowledgeGraph?.title) {
     parts.push(
       `**${data.knowledgeGraph.title}:** ${data.knowledgeGraph.description || ""}\n`,
     );
   }
-
-  // Organic results
-  for (const result of data.organic ?? []) {
+  for (const r of data.organic ?? []) {
     parts.push(
-      `${result.position ?? "-"}. **${result.title ?? "Untitled"}**`,
-      `   ${result.link ?? ""}`,
-      `   ${result.snippet ?? ""}\n`,
+      `${r.position ?? "-"}. **${r.title ?? "Untitled"}**`,
+      `   ${r.link ?? ""}`,
+      `   ${r.snippet ?? ""}\n`,
     );
   }
-
-  return { output: parts.join("\n") };
+  return parts.join("\n");
 }
 
-async function searchDdg(query: string): Promise<ToolResult> {
+async function searchDdg(query: string): Promise<string> {
   const url = new URL(DDG_ENDPOINT);
   url.searchParams.set("q", query);
   url.searchParams.set("format", "json");
@@ -107,90 +83,80 @@ async function searchDdg(query: string): Promise<ToolResult> {
   const res = await fetch(url.toString(), {
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
-
   if (!res.ok) {
-    return {
-      output: `DuckDuckGo API error (${res.status}): ${res.statusText}`,
-      error: true,
-    };
+    throw new Error(`DuckDuckGo API error (${res.status}): ${res.statusText}`);
   }
-
   const data = (await res.json()) as DdgResponse;
   const parts: string[] = [`Web search results for: "${query}"\n`];
-
-  if (data.Heading) {
-    parts.push(`**${data.Heading}**`);
-  }
+  if (data.Heading) parts.push(`**${data.Heading}**`);
   if (data.AbstractText) {
-    parts.push(`${data.AbstractText}`);
-    if (data.AbstractURL) {
-      parts.push(`Source: ${data.AbstractURL}\n`);
-    }
+    parts.push(data.AbstractText);
+    if (data.AbstractURL) parts.push(`Source: ${data.AbstractURL}\n`);
   }
-
-  // Related topics as lightweight results
   for (const topic of (data.RelatedTopics ?? []).slice(0, DEFAULT_COUNT)) {
     if (topic.Text) {
       parts.push(`- ${topic.Text}`);
-      if (topic.FirstURL) {
-        parts.push(`  ${topic.FirstURL}`);
-      }
+      if (topic.FirstURL) parts.push(`  ${topic.FirstURL}`);
     }
   }
-
   if (parts.length <= 1) {
     parts.push(
       "(No instant answer available. Try a more specific query, or use web_fetch on a search engine URL.)",
     );
   }
-
-  return { output: parts.join("\n") };
+  return parts.join("\n");
 }
 
-export const webSearchTool: Tool = {
+const WebSearchParams = Type.Object({
+  query: Type.String({ description: "Search query string." }),
+  count: Type.Optional(
+    Type.Number({
+      description: "Number of results (1-10, default 5). Serper only.",
+      minimum: 1,
+      maximum: 10,
+    }),
+  ),
+});
+
+export const webSearchTool: AgentTool<typeof WebSearchParams> = {
   name: "web_search",
+  label: "Web Search",
   description:
     "Search the web. Returns titles, URLs, and snippets. " +
     "Uses Google via Serper.dev when SERPER_API_KEY is set, " +
     "otherwise falls back to DuckDuckGo.",
-  parameters: {
-    type: "object",
-    properties: {
-      query: {
-        type: "string",
-        description: "Search query string.",
-      },
-      count: {
-        type: "number",
-        description: "Number of results (1-10, default 5). Serper only.",
-        minimum: 1,
-        maximum: 10,
-      },
-    },
-    required: ["query"],
-  },
+  parameters: WebSearchParams,
 
-  async execute(args: Record<string, unknown>): Promise<ToolResult> {
-    const query = String(args.query ?? "").trim();
+  async execute(
+    _toolCallId: string,
+    params: { query: string; count?: number },
+  ): Promise<AgentToolResult<unknown>> {
+    const query = String(params.query ?? "").trim();
     if (!query) {
-      return { output: "Error: empty search query.", error: true };
+      return {
+        content: [{ type: "text", text: "Error: empty search query." }],
+        details: { error: true },
+      };
     }
-
     const count =
-      typeof args.count === "number"
-        ? Math.max(1, Math.min(10, Math.floor(args.count)))
+      typeof params.count === "number"
+        ? Math.max(1, Math.min(10, Math.floor(params.count)))
         : DEFAULT_COUNT;
-
     const serperKey = process.env.SERPER_API_KEY?.trim();
     try {
-      if (serperKey) {
-        return await searchSerper(query, serperKey, count);
-      }
-      return await searchDdg(query);
+      const text = serperKey
+        ? await searchSerper(query, serperKey, count)
+        : await searchDdg(query);
+      return {
+        content: [{ type: "text", text }],
+        details: { query, provider: serperKey ? "serper" : "ddg" },
+      };
     } catch (err) {
       return {
-        output: `Web search error: ${(err as Error).message}`,
-        error: true,
+        content: [
+          { type: "text", text: `Web search error: ${(err as Error).message}` },
+        ],
+        details: { error: true },
       };
     }
   },

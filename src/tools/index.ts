@@ -1,39 +1,24 @@
 /**
- * Tool registry — exports all available tools and helpers.
+ * Tool registry — exports all available tools as AgentTool[].
+ *
+ * Uses the same AgentTool type from pi-agent-core that OpenClaw uses.
+ * The pi-ai library automatically converts these to Gemini functionDeclarations.
  */
 
+import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { execTool } from "./exec.js";
-import type { GeminiFunctionDeclaration, Tool, ToolResult } from "./types.js";
-import { toFunctionDeclarations } from "./types.js";
 import { webFetchTool } from "./web-fetch.js";
 import { webSearchTool } from "./web-search.js";
 
 /** All registered tools. */
-export const allTools: Tool[] = [execTool, webSearchTool, webFetchTool];
-
-/** Map for O(1) lookup by name. */
-const toolMap = new Map<string, Tool>(allTools.map((t) => [t.name, t]));
-
-/** Get Gemini functionDeclarations for all tools. */
-export function getToolDeclarations(): GeminiFunctionDeclaration[] {
-  return toFunctionDeclarations(allTools);
-}
+// biome-ignore lint/suspicious/noExplicitAny: AgentTool<TObject<...>> is contravariant on execute's params — cast needed for heterogeneous array
+export const allTools: AgentTool<any>[] = [
+  execTool,
+  webSearchTool,
+  webFetchTool,
+];
 
 /** Get tool summaries for system prompt. */
 export function getToolSummaryLines(): string[] {
   return allTools.map((t) => `- ${t.name}: ${t.description.split(".")[0]}`);
 }
-
-/** Execute a tool by name. */
-export async function executeTool(
-  name: string,
-  args: Record<string, unknown>,
-): Promise<ToolResult> {
-  const tool = toolMap.get(name);
-  if (!tool) {
-    return { output: `Unknown tool: ${name}`, error: true };
-  }
-  return tool.execute(args);
-}
-
-export type { Tool, ToolResult, GeminiFunctionDeclaration };

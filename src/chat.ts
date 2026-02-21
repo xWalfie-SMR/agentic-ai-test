@@ -1,17 +1,18 @@
 #!/usr/bin/env bun
+
 /**
  * Interactive chat via Waffle Maker (Cloud Code Assist).
  *
  * Full retained-mode TUI built on pi-tui with OpenClaw-inspired styling.
- * Supports tool use (exec, web_search, web_fetch) via Gemini function calling.
- *
- * The API layer (api.ts, oauth.ts, tokens.ts, models.ts, types.ts) is
- * intentionally kept UI-agnostic so a future web frontend can reuse it.
+ * Uses pi-agent-core's Agent class (same as OpenClaw) for streaming,
+ * tool calling, and the agentic loop.
  *
  * Usage:
  *   bun run chat
  */
 
+import type { AgentEvent } from "@mariozechner/pi-agent-core";
+import type { AssistantMessage, ToolCall } from "@mariozechner/pi-ai";
 import {
   Container,
   Loader,
@@ -22,24 +23,14 @@ import {
   Text,
   TUI,
 } from "@mariozechner/pi-tui";
-import { sendMessage } from "./api.js";
 import { fetchAvailableModels } from "./models.js";
+import { createAgent, toModel } from "./provider.js";
 import { getValidTokens } from "./tokens.js";
-import {
-  executeTool,
-  getToolDeclarations,
-  getToolSummaryLines,
-} from "./tools/index.js";
+import { allTools, getToolSummaryLines } from "./tools/index.js";
 import { ChatLog } from "./tui/chat-log.js";
 import { CustomEditor } from "./tui/custom-editor.js";
 import { editorTheme, theme } from "./tui/theme.js";
-import type {
-  ChatMessage,
-  FunctionCall,
-  ModelInfo,
-  TokenData,
-  TokenUsage,
-} from "./types.js";
+import type { ModelInfo, TokenData } from "./types.js";
 
 // ── System prompt (ported from OpenClaw) ─────────────────────────────────────
 
@@ -128,18 +119,9 @@ function buildSystemPrompt(opts: {
 
 // ── Thinking block handling ──────────────────────────────────────────────────
 
-/**
- * Regex-based inline thinking tag stripper with code-region awareness.
- *
- * Models like Claude may embed `<thinking>...</thinking>` in their text
- * output. This strips those tags and returns what was inside them,
- * while leaving tags inside code blocks/inline code untouched.
- *
- * Modeled after OpenClaw's `stripReasoningTagsFromText()`.
- */
-const QUICK_TAG_RE = /<\s*\/?(?:think(?:ing)?|thought|antthinking)\b/i;
+const QUICK_TAG_RE = /\s*\/?(?:think(?:ing)?|thought|antthinking)\b/i;
 const THINKING_TAG_RE =
-  /<\s*(\/?)\s*(?:think(?:ing)?|thought|antthinking)\b[^<>]*>/gi;
+  /<\s*(\/?)s*(?:think(?:ing)?|thought|antthinking)\b[^<>]*>/gi;
 
 interface CodeRegion {
   start: number;
@@ -148,16 +130,12 @@ interface CodeRegion {
 
 function findCodeRegions(text: string): CodeRegion[] {
   const regions: CodeRegion[] = [];
-
-  // Fenced code blocks
   const fencedRe = /(^|\n)(```|~~~)[^\n]*\n[\s\S]*?(?:\n\2(?:\n|$)|$)/g;
   for (const match of text.matchAll(fencedRe)) {
     const prefix = match[1] ?? "";
     const start = (match.index ?? 0) + prefix.length;
     regions.push({ start, end: start + match[0].length - prefix.length });
   }
-
-  // Inline code
   const inlineRe = /`+[^`]+`+/g;
   for (const match of text.matchAll(inlineRe)) {
     const start = match.index ?? 0;
@@ -167,7 +145,6 @@ function findCodeRegions(text: string): CodeRegion[] {
       regions.push({ start, end });
     }
   }
-
   regions.sort((a, b) => a.start - b.start);
   return regions;
 }
@@ -176,10 +153,6 @@ function isInsideCode(pos: number, regions: CodeRegion[]): boolean {
   return regions.some((r) => pos >= r.start && pos < r.end);
 }
 
-/**
- * Strip inline `<thinking>` tags from text, returning separated thinking
- * and content. Tags inside code blocks/inline code are left alone.
- */
 function stripInlineThinkingTags(raw: string): {
   thinking: string;
   content: string;
@@ -187,9 +160,7 @@ function stripInlineThinkingTags(raw: string): {
   if (!raw || !QUICK_TAG_RE.test(raw)) {
     return { thinking: "", content: raw };
   }
-
   const codeRegions = findCodeRegions(raw);
-
   THINKING_TAG_RE.lastIndex = 0;
   let result = "";
   let lastIndex = 0;
@@ -200,11 +171,7 @@ function stripInlineThinkingTags(raw: string): {
   for (const match of raw.matchAll(THINKING_TAG_RE)) {
     const idx = match.index ?? 0;
     const isClose = match[1] === "/";
-
-    if (isInsideCode(idx, codeRegions)) {
-      continue;
-    }
-
+    if (isInsideCode(idx, codeRegions)) continue;
     if (!inThinking) {
       result += raw.slice(lastIndex, idx);
       if (!isClose) {
@@ -215,40 +182,24 @@ function stripInlineThinkingTags(raw: string): {
       thinkingParts.push(raw.slice(currentThinkingStart, idx).trim());
       inThinking = false;
     }
-
     lastIndex = idx + match[0].length;
   }
-
   if (inThinking) {
-    // Unclosed thinking tag — treat the rest as thinking
     thinkingParts.push(raw.slice(currentThinkingStart).trim());
   } else {
     result += raw.slice(lastIndex);
   }
-
-  return {
-    thinking: thinkingParts.join("\n").trim(),
-    content: result.trim(),
-  };
+  return { thinking: thinkingParts.join("\n").trim(), content: result.trim() };
 }
 
-/**
- * Compose thinking + content into a display string.
- * When showThinking is true and thinking text exists, prepends
- * `[thinking]\n{text}` above the content (matching OpenClaw style).
- */
 function composeDisplayText(
   thinking: string,
   content: string,
   showThinking: boolean,
 ): string {
   const parts: string[] = [];
-  if (showThinking && thinking) {
-    parts.push(`[thinking]\n${thinking}`);
-  }
-  if (content) {
-    parts.push(content);
-  }
+  if (showThinking && thinking) parts.push(`[thinking]\n${thinking}`);
+  if (content) parts.push(content);
   return parts.join("\n\n").trim();
 }
 
@@ -269,15 +220,14 @@ function formatTokens(inputTokens: number, outputTokens: number): string {
 }
 
 /** Format a tool call for display in the chat log. */
-function formatToolCall(call: FunctionCall): string {
-  const argsStr = Object.entries(call.args)
+function formatToolCall(toolCall: ToolCall): string {
+  const argsStr = Object.entries(toolCall.arguments)
     .map(([k, v]) => {
       const val = typeof v === "string" ? v : JSON.stringify(v);
-      // Truncate long values
       return `${k}: ${val.length > 80 ? `${val.slice(0, 77)}…` : val}`;
     })
     .join(", ");
-  return `🔧 **${call.name}**(${argsStr})`;
+  return `🔧 **${toolCall.name}**(${argsStr})`;
 }
 
 // ── Pre-TUI setup (console-based) ────────────────────────────────────────────
@@ -314,18 +264,41 @@ async function runTui(
   let currentModel = models[0]?.id ?? "";
   let showThinking = true;
   let lastCtrlCAt = 0;
-  const history: ChatMessage[] = [];
-  let totalUsage: TokenUsage = { inputTokens: 0, outputTokens: 0 };
-  let systemPrompt = buildSystemPrompt({
-    modelId: currentModel,
-    displayName: getDisplayName(models, currentModel),
-    workspaceDir: process.cwd(),
-    ...env,
-  });
+  let totalUsage = { inputTokens: 0, outputTokens: 0 };
   let isBusy = false;
 
-  // Tool declarations for Gemini
-  const toolDeclarations = getToolDeclarations();
+  // Create the pi-agent-core Agent
+  const initialModelInfo =
+    models.find((m) => m.id === currentModel) ?? models[0];
+  if (!initialModelInfo) throw new Error("No models available");
+  let agent = createAgent(
+    toModel(initialModelInfo),
+    allTools,
+    buildSystemPrompt({
+      modelId: currentModel,
+      displayName: getDisplayName(models, currentModel),
+      workspaceDir: process.cwd(),
+      ...env,
+    }),
+    tokens.projectId,
+  );
+
+  // Helper to rebuild agent when model changes
+  const rebuildAgent = () => {
+    const modelInfo = models.find((m) => m.id === currentModel) ?? models[0];
+    if (!modelInfo) return;
+    agent = createAgent(
+      toModel(modelInfo),
+      allTools,
+      buildSystemPrompt({
+        modelId: currentModel,
+        displayName: getDisplayName(models, currentModel),
+        workspaceDir: process.cwd(),
+        ...env,
+      }),
+      tokens.projectId,
+    );
+  };
 
   // ── Layout ───────────────────────────────────────────────────────────────
   const tui = new TUI(new ProcessTerminal());
@@ -346,21 +319,19 @@ async function runTui(
   tui.setFocus(editor);
 
   // ── Status helpers ───────────────────────────────────────────────────────
-  let statusText: Text | null = null;
   let statusLoader: Loader | null = null;
 
   const setStatusIdle = (text: string) => {
     statusContainer.clear();
     statusLoader?.stop();
     statusLoader = null;
-    statusText = new Text(theme.dim(text), 1, 0);
+    const statusText = new Text(theme.dim(text), 1, 0);
     statusContainer.addChild(statusText);
     tui.requestRender();
   };
 
   const setStatusBusy = (label: string) => {
     statusContainer.clear();
-    statusText = null;
     statusLoader = new Loader(
       tui,
       (spinner) => theme.accent(spinner),
@@ -380,12 +351,9 @@ async function runTui(
 
   const updateFooter = () => {
     const modelLabel = getDisplayName(models, currentModel);
-    const tokens = formatTokens(
-      totalUsage.inputTokens,
-      totalUsage.outputTokens,
-    );
+    const tkns = formatTokens(totalUsage.inputTokens, totalUsage.outputTokens);
     const thinkLabel = showThinking ? "on" : "off";
-    const parts = [modelLabel, `think ${thinkLabel}`, tokens];
+    const parts = [modelLabel, `think ${thinkLabel}`, tkns];
     footer.setText(theme.dim(parts.join(" | ")));
   };
 
@@ -405,17 +373,11 @@ async function runTui(
     }));
 
     const list = new SelectList(items, 20, editorTheme.selectList);
-
     let overlayHandle: OverlayHandle | undefined;
 
     list.onSelect = (item) => {
       currentModel = item.value as string;
-      systemPrompt = buildSystemPrompt({
-        modelId: currentModel,
-        displayName: getDisplayName(models, currentModel),
-        workspaceDir: process.cwd(),
-        ...env,
-      });
+      rebuildAgent();
       updateHeader();
       updateFooter();
       chatLog.addSystem(`Switched to ${getDisplayName(models, currentModel)}`);
@@ -438,164 +400,184 @@ async function runTui(
     tui.setFocus(list);
   };
 
-  // ── Send message (with tool calling loop) ───────────────────────────────
+  // ── Send message (Agent-based — pi-agent-core handles the tool loop) ───
   const doSendMessage = async (text: string) => {
     if (isBusy) return;
     isBusy = true;
 
     chatLog.addUser(text);
-    history.push({ role: "user", content: text });
-
-    // Show streaming indicator
     setStatusBusy("streaming");
 
-    // Agentic tool-calling loop: keep going until the model responds with text
-    let loopCount = 0;
-    const MAX_TOOL_LOOPS = 15;
+    // Track streaming state for TUI display
+    let structuredThinking = "";
+    let rawContent = "";
+    // Using a mutable wrapper so reassignment inside callbacks is visible to outer scope
+    const usageRef: { input: number; output: number; valid: boolean } = {
+      input: 0,
+      output: 0,
+      valid: false,
+    };
 
-    while (loopCount < MAX_TOOL_LOOPS) {
-      loopCount++;
+    const refreshDisplay = () => {
+      const { thinking: inlineThinking, content: strippedContent } =
+        stripInlineThinkingTags(rawContent);
+      const allThinking = [structuredThinking, inlineThinking]
+        .filter(Boolean)
+        .join("\n");
+      const display = composeDisplayText(
+        allThinking,
+        strippedContent,
+        showThinking,
+      );
+      chatLog.updateAssistant(display || "…");
+      tui.requestRender();
+    };
 
-      // Track thinking and content text separately during streaming
-      let structuredThinking = "";
-      let rawContent = "";
-
-      const refreshDisplay = () => {
-        const { thinking: inlineThinking, content: strippedContent } =
-          stripInlineThinkingTags(rawContent);
-        const allThinking = [structuredThinking, inlineThinking]
-          .filter(Boolean)
-          .join("\n");
-        const display = composeDisplayText(
-          allThinking,
-          strippedContent,
-          showThinking,
-        );
-        chatLog.updateAssistant(display || "…");
-        tui.requestRender();
-      };
-
-      try {
-        const result = await sendMessage({
-          accessToken: tokens.access,
-          projectId: tokens.projectId,
-          modelId: currentModel,
-          messages: history,
-          systemPrompt,
-          tools: toolDeclarations,
-          onText: (chunk) => {
-            rawContent += chunk;
+    // Subscribe to agent events for TUI display
+    const unsubscribe = agent.subscribe((event: AgentEvent) => {
+      switch (event.type) {
+        case "message_update": {
+          const e = event.assistantMessageEvent;
+          if (e.type === "text_delta") {
+            rawContent += e.delta;
             refreshDisplay();
-          },
-          onThinking: (chunk) => {
-            structuredThinking += chunk;
+          } else if (e.type === "thinking_delta") {
+            structuredThinking += e.delta;
             refreshDisplay();
-          },
-          onFunctionCall: () => {},
-        });
-
-        // Accumulate token usage
-        totalUsage.inputTokens += result.usage.inputTokens;
-        totalUsage.outputTokens += result.usage.outputTokens;
-        updateFooter();
-
-        // Does the model want to call a tool?
-        if (result.functionCall) {
-          const call = result.functionCall;
-
-          // Show the tool call in the chat log
-          chatLog.finalizeAssistant(formatToolCall(call));
-
-          // Push the function call into history
-          history.push({
-            role: "function_call",
-            content: "",
-            functionCall: call,
-          });
-
-          // Execute the tool
-          setStatusBusy(`running ${call.name}…`);
-          const toolResult = await executeTool(call.name, call.args);
-
-          // Show result preview in chat
-          const preview =
-            toolResult.output.length > 500
-              ? `${toolResult.output.slice(0, 497)}…`
-              : toolResult.output;
-          chatLog.addSystem(
-            `${toolResult.error ? "⚠️" : "✅"} ${call.name}: ${preview}`,
-          );
-          tui.requestRender();
-
-          // Push the function response into history
-          history.push({
-            role: "function_response",
-            content: "",
-            functionResponse: {
-              name: call.name,
-              response: {
-                output: toolResult.output,
-                ...(toolResult.error ? { error: true } : {}),
-              },
-            },
-          });
-
-          // Continue the loop — model will process the tool result
-          setStatusBusy("streaming");
-          continue;
-        }
-
-        // No tool call — model responded with text. Finalize.
-        const { thinking: inlineThinking, content: strippedContent } =
-          stripInlineThinkingTags(rawContent);
-        const allThinking = [structuredThinking, inlineThinking]
-          .filter(Boolean)
-          .join("\n");
-        const finalDisplay = composeDisplayText(
-          allThinking,
-          strippedContent,
-          showThinking,
-        );
-        chatLog.finalizeAssistant(finalDisplay || "(no output)");
-
-        // Store clean content in history (no thinking)
-        history.push({ role: "assistant", content: strippedContent });
-
-        setStatusIdle(
-          `${formatTokens(result.usage.inputTokens, result.usage.outputTokens)} | ready`,
-        );
-        break; // Done — exit the loop
-      } catch (err) {
-        chatLog.dropAssistant();
-        if (loopCount === 1) {
-          history.pop(); // Remove failed user message
-        }
-        chatLog.addSystem(`Error: ${(err as Error).message}`);
-
-        // Try token refresh on 401
-        if ((err as Error).message.includes("401")) {
-          chatLog.addSystem("Attempting token refresh…");
-          const refreshed = await getValidTokens();
-          if (refreshed) {
-            tokens.access = refreshed.access;
-            tokens.expires = refreshed.expires;
-            chatLog.addSystem("Token refreshed. Try again.");
-          } else {
-            chatLog.addSystem("Refresh failed. Run `bun run auth`.");
           }
+          // Track usage from the partial message
+          if ("partial" in e && e.partial) {
+            const msg = e.partial as AssistantMessage;
+            if (msg.usage) {
+              usageRef.input = msg.usage.input;
+              usageRef.output = msg.usage.output;
+              usageRef.valid = true;
+            }
+          }
+          break;
         }
-        setStatusIdle("error | ready");
-        break;
+        case "message_end": {
+          // Extract final usage from the completed message
+          const msg = event.message;
+          if (msg && "usage" in msg) {
+            const aMsg = msg as AssistantMessage;
+            usageRef.input = aMsg.usage.input;
+            usageRef.output = aMsg.usage.output;
+            usageRef.valid = true;
+          }
+          break;
+        }
+        case "tool_execution_start": {
+          // Finalize any current assistant text, show the tool call
+          if (rawContent.trim()) {
+            const { thinking: inlineThinking, content: strippedContent } =
+              stripInlineThinkingTags(rawContent);
+            const allThinking = [structuredThinking, inlineThinking]
+              .filter(Boolean)
+              .join("\n");
+            const display = composeDisplayText(
+              allThinking,
+              strippedContent,
+              showThinking,
+            );
+            chatLog.finalizeAssistant(display);
+            rawContent = "";
+            structuredThinking = "";
+          }
+
+          // Show tool call
+          const tc: ToolCall = {
+            type: "toolCall",
+            id: event.toolCallId,
+            name: event.toolName,
+            arguments: event.args ?? {},
+          };
+          chatLog.addSystem(formatToolCall(tc));
+          setStatusBusy(`running ${event.toolName}…`);
+          tui.requestRender();
+          break;
+        }
+        case "tool_execution_end": {
+          // Show result preview
+          const resultText =
+            event.result?.content
+              ?.map((c: { type: string; text?: string }) =>
+                c.type === "text" ? c.text : "",
+              )
+              .join("") ?? JSON.stringify(event.result);
+          const preview =
+            resultText.length > 500
+              ? `${resultText.slice(0, 497)}…`
+              : resultText;
+          const icon = event.isError ? "⚠️" : "✅";
+          chatLog.addSystem(`${icon} ${event.toolName}: ${preview}`);
+          setStatusBusy("streaming");
+          tui.requestRender();
+          break;
+        }
+        case "turn_start": {
+          // Reset content tracking for new turn (after tool results)
+          rawContent = "";
+          structuredThinking = "";
+          break;
+        }
       }
-    }
+    });
 
-    if (loopCount >= MAX_TOOL_LOOPS) {
-      chatLog.addSystem("⚠️ Tool loop limit reached (max 15 calls per turn).");
-      setStatusIdle("tool limit | ready");
-    }
+    try {
+      await agent.prompt(text);
 
-    isBusy = false;
-    tui.requestRender();
+      // Accumulate token usage
+      if (usageRef.valid) {
+        totalUsage.inputTokens += usageRef.input;
+        totalUsage.outputTokens += usageRef.output;
+      }
+      updateFooter();
+
+      // Finalize the last assistant message
+      const { thinking: inlineThinking, content: strippedContent } =
+        stripInlineThinkingTags(rawContent);
+      const allThinking = [structuredThinking, inlineThinking]
+        .filter(Boolean)
+        .join("\n");
+      const finalDisplay = composeDisplayText(
+        allThinking,
+        strippedContent,
+        showThinking,
+      );
+      chatLog.finalizeAssistant(finalDisplay || "(no output)");
+
+      const statusParts: string[] = [];
+      if (usageRef.valid) {
+        statusParts.push(formatTokens(usageRef.input, usageRef.output));
+      }
+      statusParts.push("ready");
+      setStatusIdle(statusParts.join(" | "));
+    } catch (err) {
+      chatLog.dropAssistant();
+      chatLog.addSystem(`Error: ${(err as Error).message}`);
+
+      // Try token refresh on auth errors
+      if (
+        (err as Error).message.includes("401") ||
+        (err as Error).message.includes("OAuth")
+      ) {
+        chatLog.addSystem("Attempting token refresh…");
+        const refreshed = await getValidTokens();
+        if (refreshed) {
+          tokens.access = refreshed.access;
+          tokens.expires = refreshed.expires;
+          chatLog.addSystem("Token refreshed. Try again.");
+        } else {
+          chatLog.addSystem("Refresh failed. Run `bun run auth`.");
+        }
+      }
+      setStatusIdle("error | ready");
+    } finally {
+      unsubscribe();
+      isBusy = false;
+      tui.requestRender();
+    }
   };
 
   // ── Command handling ─────────────────────────────────────────────────────
@@ -605,10 +587,7 @@ async function runTui(
     if (cmd === "/quit" || cmd === "/exit") {
       tui.stop();
       const total = totalUsage.inputTokens + totalUsage.outputTokens;
-      const msgs = history.filter((m) => m.role === "user").length;
-      console.log(
-        `\nSession ended. ${msgs} messages, ${formatTokenCount(total)} total tokens.`,
-      );
+      console.log(`\nSession ended. ${formatTokenCount(total)} total tokens.`);
       process.exit(0);
     }
 
@@ -618,9 +597,9 @@ async function runTui(
     }
 
     if (cmd === "/clear") {
-      history.length = 0;
       totalUsage = { inputTokens: 0, outputTokens: 0 };
       chatLog.clearAll();
+      rebuildAgent(); // Fresh agent = fresh conversation
       updateFooter();
       chatLog.addSystem("Conversation cleared.");
       tui.requestRender();
@@ -636,7 +615,7 @@ async function runTui(
     }
 
     if (cmd === "/history") {
-      const msgs = history.filter((m) => m.role === "user").length;
+      const msgs = agent.state.messages.filter((m) => m.role === "user").length;
       const total = totalUsage.inputTokens + totalUsage.outputTokens;
       chatLog.addSystem(
         `${msgs} messages | ${formatTokens(totalUsage.inputTokens, totalUsage.outputTokens)} | ${formatTokenCount(total)} total`,
@@ -666,6 +645,13 @@ async function runTui(
   };
 
   editor.onCtrlC = () => {
+    if (isBusy) {
+      agent.abort();
+      setStatusIdle("aborted | ready");
+      isBusy = false;
+      tui.requestRender();
+      return;
+    }
     if (editor.getText().trim().length > 0) {
       editor.setText("");
       setStatusIdle("cleared input | ready");
@@ -696,8 +682,6 @@ async function runTui(
 
   // ── Start ────────────────────────────────────────────────────────────────
   tui.start();
-
-  // Show model selector on startup
   openModelSelector();
 }
 
@@ -710,7 +694,6 @@ async function main(): Promise<void> {
   const env = await detectEnvironment();
   const models = await loadModels(tokens);
 
-  // Clear console before entering TUI
   console.clear();
 
   await runTui(tokens, models, env);

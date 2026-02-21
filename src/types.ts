@@ -59,31 +59,3 @@ export interface ModelInfo {
   /** ISO 8601 timestamp when the quota resets. */
   resetTime?: string;
 }
-
-/** A function call requested by the model. */
-export interface FunctionCall {
-  name: string;
-  args: Record<string, unknown>;
-}
-
-/** A function response to send back to the model. */
-export interface FunctionResponse {
-  name: string;
-  response: Record<string, unknown>;
-}
-
-/** A single message in a conversation history. */
-export interface ChatMessage {
-  role: "user" | "assistant" | "function_call" | "function_response";
-  content: string;
-  /** Present when role is "function_call". */
-  functionCall?: FunctionCall;
-  /** Present when role is "function_response". */
-  functionResponse?: FunctionResponse;
-}
-
-/** Token usage counters returned after a completion. */
-export interface TokenUsage {
-  inputTokens: number;
-  outputTokens: number;
-}
