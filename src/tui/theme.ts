@@ -1,5 +1,5 @@
 /**
- * Terminal UI theme — OpenClaw-inspired warm palette.
+ * Terminal UI theme.
  *
  * This module is TUI-specific; the API layer (api.ts, oauth.ts, tokens.ts,
  * models.ts, types.ts) remains UI-agnostic so a web frontend can reuse it.

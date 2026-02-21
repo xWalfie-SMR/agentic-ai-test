@@ -3,8 +3,8 @@
 /**
  * Interactive chat via Waffle Maker (Cloud Code Assist).
  *
- * Full retained-mode TUI built on pi-tui with OpenClaw-inspired styling.
- * Uses pi-agent-core's Agent class (same as OpenClaw) for streaming,
+ * Full retained-mode TUI built on pi-tui.
+ * Uses pi-agent-core's Agent class for streaming,
  * tool calling, and the agentic loop.
  *
  * Usage:
@@ -33,8 +33,6 @@ import { getSlashCommands, helpText, parseCommand } from "./tui/commands.js";
 import { CustomEditor } from "./tui/custom-editor.js";
 import { editorTheme, theme } from "./tui/theme.js";
 import type { ModelInfo, TokenData } from "./types.js";
-
-// ── System prompt (ported from OpenClaw) ─────────────────────────────────────
 
 /** Run a shell command and return trimmed stdout (empty string on failure). */
 async function shellExec(cmd: string): Promise<string> {
@@ -74,10 +72,7 @@ async function detectEnvironment(): Promise<{
   };
 }
 
-/**
- * Build the system prompt — a direct port of OpenClaw's `buildAgentSystemPrompt`,
- * adapted for Waffle Maker with local tool availability.
- */
+/** Build the system prompt. */
 function buildSystemPrompt(opts: {
   modelId: string;
   displayName: string;
@@ -118,8 +113,6 @@ function buildSystemPrompt(opts: {
 
   return lines.filter(Boolean).join("\n");
 }
-
-// ── Thinking block handling ──────────────────────────────────────────────────
 
 const QUICK_TAG_RE = /\s*\/?(?:think(?:ing)?|thought|antthinking)\b/i;
 const THINKING_TAG_RE =
@@ -205,8 +198,6 @@ function composeDisplayText(
   return parts.join("\n\n").trim();
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
 function getDisplayName(models: ModelInfo[], id: string): string {
   return models.find((m) => m.id === id)?.displayName ?? id;
 }
@@ -232,8 +223,6 @@ function formatToolCall(toolCall: ToolCall): string {
   return `🔧 **${toolCall.name}**(${argsStr})`;
 }
 
-// ── Pre-TUI setup (console-based) ────────────────────────────────────────────
-
 async function loadAuth(): Promise<TokenData> {
   const tokens = await getValidTokens();
   if (!tokens) {
@@ -255,21 +244,17 @@ async function loadModels(tokens: TokenData): Promise<ModelInfo[]> {
   return models;
 }
 
-// ── TUI ──────────────────────────────────────────────────────────────────────
-
 async function runTui(
   tokens: TokenData,
   models: ModelInfo[],
   env: { distro: string; de: string; shell: string; hostname: string },
 ): Promise<void> {
-  // ── State ────────────────────────────────────────────────────────────────
   let currentModel = models[0]?.id ?? "";
   let showThinking = true;
   let lastCtrlCAt = 0;
   let totalUsage = { inputTokens: 0, outputTokens: 0 };
   let isBusy = false;
 
-  // Create AgentSession using createAgentSession (same as OpenClaw)
   const initialModelInfo =
     models.find((m) => m.id === currentModel) ?? models[0];
   if (!initialModelInfo) throw new Error("No models available");
@@ -302,7 +287,6 @@ async function runTui(
     );
   };
 
-  // ── Layout ───────────────────────────────────────────────────────────────
   const tui = new TUI(new ProcessTerminal());
   const header = new Text("", 1, 0);
   const chatLog = new ChatLog();
@@ -310,7 +294,6 @@ async function runTui(
   const footer = new Text("", 1, 0);
   const editor = new CustomEditor(tui, editorTheme);
 
-  // Slash command autocomplete (copied from OpenClaw tui.ts)
   const slashCommands = getSlashCommands();
   editor.setAutocompleteProvider(
     new CombinedAutocompleteProvider(slashCommands),
@@ -326,7 +309,6 @@ async function runTui(
   tui.addChild(root);
   tui.setFocus(editor);
 
-  // ── Status helpers ───────────────────────────────────────────────────────
   let statusLoader: Loader | null = null;
 
   const setStatusIdle = (text: string) => {
@@ -350,7 +332,6 @@ async function runTui(
     tui.requestRender();
   };
 
-  // ── Header / Footer ─────────────────────────────────────────────────────
   const updateHeader = () => {
     header.setText(
       theme.header(`🧇 waffle maker — ${getDisplayName(models, currentModel)}`),
@@ -369,9 +350,6 @@ async function runTui(
   updateFooter();
   setStatusIdle("ready | /help for commands");
 
-  // ── Model selector (OpenClaw showSelector pattern) ────────────────────────
-  // Replaces the editor with a full-height selector, then restores on done.
-  // Copied from OpenClaw interactive-mode.ts showSelector() + showModelSelector().
   const openModelSelector = () => {
     const items: SelectItem[] = models.map((m) => ({
       label: m.displayName ?? m.id,
@@ -384,7 +362,7 @@ async function runTui(
 
     const list = new SelectList(items, 20, editorTheme.selectList);
 
-    // done() restores the editor (same as OpenClaw's showSelector)
+    // done() restores the editor
     const done = () => {
       root.removeChild(list);
       root.addChild(editor);
@@ -405,14 +383,12 @@ async function runTui(
       done();
     };
 
-    // Replace editor with selector (OpenClaw pattern)
     root.removeChild(editor);
     root.addChild(list);
     tui.setFocus(list);
     tui.requestRender();
   };
 
-  // ── Send message (Agent-based — pi-agent-core handles the tool loop) ───
   const doSendMessage = async (text: string) => {
     if (isBusy) return;
     isBusy = true;
@@ -606,8 +582,6 @@ async function runTui(
     }
   };
 
-  // ── Command handling ─────────────────────────────────────────────────────
-  // Command handling (uses parseCommand from OpenClaw commands.ts)
   const handleCommand = (input: string) => {
     const { name, args } = parseCommand(input);
     if (!name) return;
@@ -648,7 +622,7 @@ async function runTui(
           chatLog.addSystem("nothing to abort");
         } else {
           chatLog.addSystem("aborting...");
-          // The abort is handled via the stream — set flag so next loop breaks
+
           isBusy = false;
         }
         break;
@@ -680,7 +654,6 @@ async function runTui(
     tui.requestRender();
   };
 
-  // ── Editor wiring ────────────────────────────────────────────────────────
   editor.onSubmit = (text: string) => {
     const value = text.trim();
     editor.setText("");
@@ -732,12 +705,9 @@ async function runTui(
     tui.requestRender();
   };
 
-  // ── Start ────────────────────────────────────────────────────────────────
   tui.start();
   openModelSelector();
 }
-
-// ── Main ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
   console.log("🧇 Waffle Maker\n");

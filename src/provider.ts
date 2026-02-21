@@ -1,8 +1,5 @@
 /**
- * Provider layer — uses ModelRegistry.find() for model resolution
- * (same as OpenClaw's resolveModel in pi-embedded-runner/model.ts).
- *
- * Session factory copied from OpenClaw's attempt.ts createAgentSession pattern.
+ * Provider layer: model resolution via ModelRegistry and session creation.
  */
 
 import type { AgentTool } from "@mariozechner/pi-agent-core";
@@ -18,8 +15,6 @@ import {
 import { CODE_ASSIST_BASE } from "./constants.js";
 import { loadTokens } from "./tokens.js";
 import type { ModelInfo } from "./types.js";
-
-// ── Model resolution (via ModelRegistry, same as OpenClaw) ──────────────────
 
 const PROVIDER = "google-antigravity";
 
@@ -50,8 +45,6 @@ export function toModel(info: ModelInfo): Model<Api> {
     maxTokens: 65_536,
   };
 }
-
-// ── Session factory (copied from OpenClaw attempt.ts) ────────────────────────
 
 export async function createSession(
   model: Model<Api>,

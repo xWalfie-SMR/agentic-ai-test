@@ -1,8 +1,5 @@
 /**
- * Tool registry — exports all available tools as AgentTool[].
- *
- * Uses the same AgentTool type from pi-agent-core that OpenClaw uses.
- * The pi-ai library automatically converts these to Gemini functionDeclarations.
+ * Tool registry: exports all available tools as AgentTool[].
  */
 
 import type { AgentTool } from "@mariozechner/pi-agent-core";
