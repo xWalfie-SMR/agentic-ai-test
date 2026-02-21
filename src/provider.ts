@@ -1,26 +1,25 @@
 /**
- * Provider layer using @mariozechner/pi-ai — matches OpenClaw's architecture.
+ * Provider layer — copied from OpenClaw's attempt.ts createAgentSession pattern.
  *
- * Creates Model objects for the google-gemini-cli API (Cloud Code Assist proxy)
- * and provides an Agent factory with tools pre-wired.
+ * OpenClaw source: /opt/openclaw/src/agents/pi-embedded-runner/run/attempt.ts lines 575-586
+ * Adapted for Waffle Maker by replacing auth/model variables.
  */
 
-import { Agent, type AgentTool } from "@mariozechner/pi-agent-core";
-import { type Model, streamSimple } from "@mariozechner/pi-ai";
+import type { AgentTool } from "@mariozechner/pi-agent-core";
+import type { Model } from "@mariozechner/pi-ai";
+import {
+  type AgentSession,
+  AuthStorage,
+  createAgentSession,
+  SessionManager,
+  SettingsManager,
+} from "@mariozechner/pi-coding-agent";
 import { CODE_ASSIST_BASE } from "./constants.js";
 import { loadTokens } from "./tokens.js";
 import type { ModelInfo } from "./types.js";
 
-// ───────────────────────────────────────────────
-// Model resolution
-// ───────────────────────────────────────────────
+// ── Model resolution (unchanged) ────────────────────────────────────────────
 
-/**
- * Create a pi-ai Model<"google-gemini-cli"> from our ModelInfo.
- *
- * The google-gemini-cli provider in pi-ai handles the Cloud Code Assist
- * proxy including tools, thinking, SSE streaming, etc.
- */
 export function toModel(info: ModelInfo): Model<"google-gemini-cli"> {
   const isReasoning =
     /think|reason/i.test(info.id) ||
@@ -43,48 +42,62 @@ export function toModel(info: ModelInfo): Model<"google-gemini-cli"> {
   };
 }
 
-// ───────────────────────────────────────────────
-// Agent factory
-// ───────────────────────────────────────────────
+// ── Session factory (copied from OpenClaw attempt.ts) ────────────────────────
 
 /**
- * Create a pi-agent-core Agent wired for Cloud Code Assist.
+ * Copied from OpenClaw's attempt.ts lines 575-586:
  *
- * The Agent handles:
- *  - Streaming via streamSimple (google-gemini-cli provider)
- *  - Tool calling loop (model calls tool → execute → feed back → repeat)
- *  - Message history
- *  - Abort/timeout
+ *   ({ session } = await createAgentSession({
+ *     cwd: resolvedWorkspace,
+ *     agentDir,
+ *     authStorage: params.authStorage,
+ *     modelRegistry: params.modelRegistry,
+ *     model: params.model,
+ *     thinkingLevel: mapThinkingLevel(params.thinkLevel),
+ *     tools: builtInTools,
+ *     customTools: allCustomTools,
+ *     sessionManager,
+ *     settingsManager,
+ *   }));
  *
- * The google-gemini-cli provider expects apiKey to be a JSON-encoded
- * string: `{ token, projectId }`.
- *
- * @param model - Model object from toModel()
- * @param tools - AgentTool[] to register
- * @param systemPrompt - System prompt text
- * @param projectId - Cloud Code Assist project ID
+ * Adapted: we inject our OAuth token via AuthStorage.setRuntimeApiKey()
+ * (same as OpenClaw's main.ts line 588: authStorage.setRuntimeApiKey(...))
  */
-export function createAgent(
+export async function createSession(
   model: Model<"google-gemini-cli">,
   tools: AgentTool[],
   systemPrompt: string,
   projectId: string,
-): Agent {
-  const agent = new Agent({
-    initialState: {
-      model,
-      tools,
-      systemPrompt,
-    },
-    streamFn: streamSimple,
-    // Provide the OAuth access token for each LLM call.
-    // The google-gemini-cli provider expects apiKey to be JSON: { token, projectId }
-    getApiKey: async (_provider: string) => {
-      const tokens = await loadTokens();
-      if (!tokens?.access) return undefined;
-      return JSON.stringify({ token: tokens.access, projectId });
-    },
+): Promise<AgentSession> {
+  const tokens = await loadTokens();
+  if (!tokens?.access) throw new Error("No OAuth token available");
+
+  // Same as OpenClaw main.ts: authStorage.setRuntimeApiKey(provider, apiKey)
+  const authStorage = AuthStorage.create();
+  authStorage.setRuntimeApiKey(
+    "google-gemini-cli",
+    JSON.stringify({ token: tokens.access, projectId }),
+  );
+
+  const cwd = process.cwd();
+  // Same as OpenClaw attempt.ts: SettingsManager.create(cwd, agentDir)
+  const settingsManager = SettingsManager.create(cwd);
+  // Same as OpenClaw attempt.ts: SessionManager.open(...) — we use inMemory
+  const sessionManager = SessionManager.inMemory();
+
+  // Copied from OpenClaw attempt.ts lines 575-586
+  const { session } = await createAgentSession({
+    cwd,
+    authStorage,
+    model,
+    tools: [], // no built-in coding tools
+    customTools: tools, // our waffle maker tools
+    sessionManager,
+    settingsManager,
   });
 
-  return agent;
+  // Same as OpenClaw attempt.ts line 587: applySystemPromptOverrideToSession
+  session.agent.setSystemPrompt(systemPrompt);
+
+  return session;
 }

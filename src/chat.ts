@@ -13,10 +13,10 @@
 
 import type { AgentEvent } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, ToolCall } from "@mariozechner/pi-ai";
+import type { AgentSession } from "@mariozechner/pi-coding-agent";
 import {
   Container,
   Loader,
-  type OverlayHandle,
   ProcessTerminal,
   type SelectItem,
   SelectList,
@@ -24,7 +24,7 @@ import {
   TUI,
 } from "@mariozechner/pi-tui";
 import { fetchAvailableModels } from "./models.js";
-import { createAgent, toModel } from "./provider.js";
+import { createSession, toModel } from "./provider.js";
 import { getValidTokens } from "./tokens.js";
 import { allTools, getToolSummaryLines } from "./tools/index.js";
 import { ChatLog } from "./tui/chat-log.js";
@@ -267,11 +267,11 @@ async function runTui(
   let totalUsage = { inputTokens: 0, outputTokens: 0 };
   let isBusy = false;
 
-  // Create the pi-agent-core Agent
+  // Create AgentSession using createAgentSession (same as OpenClaw)
   const initialModelInfo =
     models.find((m) => m.id === currentModel) ?? models[0];
   if (!initialModelInfo) throw new Error("No models available");
-  let agent = createAgent(
+  let session: AgentSession = await createSession(
     toModel(initialModelInfo),
     allTools,
     buildSystemPrompt({
@@ -283,11 +283,11 @@ async function runTui(
     tokens.projectId,
   );
 
-  // Helper to rebuild agent when model changes
-  const rebuildAgent = () => {
+  // Helper to rebuild session when model changes
+  const rebuildAgent = async () => {
     const modelInfo = models.find((m) => m.id === currentModel) ?? models[0];
     if (!modelInfo) return;
-    agent = createAgent(
+    session = await createSession(
       toModel(modelInfo),
       allTools,
       buildSystemPrompt({
@@ -359,9 +359,11 @@ async function runTui(
 
   updateHeader();
   updateFooter();
-  setStatusIdle("ready | /model /clear /thinking /quit");
+  setStatusIdle("ready | /help for commands");
 
-  // ── Model selector overlay ───────────────────────────────────────────────
+  // ── Model selector (OpenClaw showSelector pattern) ────────────────────────
+  // Replaces the editor with a full-height selector, then restores on done.
+  // Copied from OpenClaw interactive-mode.ts showSelector() + showModelSelector().
   const openModelSelector = () => {
     const items: SelectItem[] = models.map((m) => ({
       label: m.displayName ?? m.id,
@@ -373,31 +375,33 @@ async function runTui(
     }));
 
     const list = new SelectList(items, 20, editorTheme.selectList);
-    let overlayHandle: OverlayHandle | undefined;
+
+    // done() restores the editor (same as OpenClaw's showSelector)
+    const done = () => {
+      root.removeChild(list);
+      root.addChild(editor);
+      tui.setFocus(editor);
+      tui.requestRender();
+    };
 
     list.onSelect = (item) => {
       currentModel = item.value as string;
-      rebuildAgent();
+      void rebuildAgent();
       updateHeader();
       updateFooter();
       chatLog.addSystem(`Switched to ${getDisplayName(models, currentModel)}`);
-      overlayHandle?.hide();
-      tui.setFocus(editor);
-      tui.requestRender();
+      done();
     };
 
     list.onCancel = () => {
-      overlayHandle?.hide();
-      tui.setFocus(editor);
-      tui.requestRender();
+      done();
     };
 
-    overlayHandle = tui.showOverlay(list, {
-      width: "60%",
-      maxHeight: "60%",
-      anchor: "center",
-    });
+    // Replace editor with selector (OpenClaw pattern)
+    root.removeChild(editor);
+    root.addChild(list);
     tui.setFocus(list);
+    tui.requestRender();
   };
 
   // ── Send message (Agent-based — pi-agent-core handles the tool loop) ───
@@ -434,7 +438,7 @@ async function runTui(
     };
 
     // Subscribe to agent events for TUI display
-    const unsubscribe = agent.subscribe((event: AgentEvent) => {
+    const unsubscribe = session.agent.subscribe((event: AgentEvent) => {
       switch (event.type) {
         case "message_update": {
           const e = event.assistantMessageEvent;
@@ -457,13 +461,22 @@ async function runTui(
           break;
         }
         case "message_end": {
-          // Extract final usage from the completed message
+          // Extract final usage and check for errors
           const msg = event.message;
           if (msg && "usage" in msg) {
             const aMsg = msg as AssistantMessage;
             usageRef.input = aMsg.usage.input;
             usageRef.output = aMsg.usage.output;
             usageRef.valid = true;
+          }
+          // Surface API errors as assistant content so they don't show as "(no output)"
+          if (
+            msg &&
+            "errorMessage" in msg &&
+            (msg as unknown as Record<string, unknown>).errorMessage &&
+            !rawContent.trim()
+          ) {
+            rawContent = `⚠️ ${(msg as unknown as Record<string, unknown>).errorMessage as string}`;
           }
           break;
         }
@@ -522,33 +535,15 @@ async function runTui(
           break;
         }
         case "agent_end": {
-          // Check for errors in the final messages
-          const msgs = event.messages ?? [];
-          for (const m of msgs) {
-            if (
-              "errorMessage" in m &&
-              (m as Record<string, unknown>).errorMessage
-            ) {
-              const errMsg = (m as Record<string, unknown>)
-                .errorMessage as string;
-              chatLog.addSystem(`Agent error: ${errMsg}`);
-            }
-          }
           break;
         }
-        default: {
-          // Debug: log unhandled event types to stderr
-          const evType = (event as { type: string }).type;
-          if (evType !== "agent_start") {
-            process.stderr.write(`[debug] event: ${evType}\n`);
-          }
+        default:
           break;
-        }
       }
     });
 
     try {
-      await agent.prompt(text);
+      await session.prompt(text);
 
       // Accumulate token usage
       if (usageRef.valid) {
@@ -622,14 +617,14 @@ async function runTui(
     if (cmd === "/clear") {
       totalUsage = { inputTokens: 0, outputTokens: 0 };
       chatLog.clearAll();
-      rebuildAgent(); // Fresh agent = fresh conversation
+      void rebuildAgent(); // Fresh session = fresh conversation
       updateFooter();
       chatLog.addSystem("Conversation cleared.");
       tui.requestRender();
       return;
     }
 
-    if (cmd === "/thinking") {
+    if (cmd === "/think" || cmd === "/thinking") {
       showThinking = !showThinking;
       updateFooter();
       chatLog.addSystem(`Thinking display: ${showThinking ? "on" : "off"}`);
@@ -637,8 +632,20 @@ async function runTui(
       return;
     }
 
-    if (cmd === "/history") {
-      const msgs = agent.state.messages.filter((m) => m.role === "user").length;
+    if (cmd === "/new") {
+      totalUsage = { inputTokens: 0, outputTokens: 0 };
+      chatLog.clearAll();
+      void rebuildAgent();
+      updateFooter();
+      chatLog.addSystem("New session started.");
+      tui.requestRender();
+      return;
+    }
+
+    if (cmd === "/history" || cmd === "/session") {
+      const msgs = session.agent.state.messages.filter(
+        (m) => m.role === "user",
+      ).length;
       const total = totalUsage.inputTokens + totalUsage.outputTokens;
       chatLog.addSystem(
         `${msgs} messages | ${formatTokens(totalUsage.inputTokens, totalUsage.outputTokens)} | ${formatTokenCount(total)} total`,
@@ -647,7 +654,26 @@ async function runTui(
       return;
     }
 
-    chatLog.addSystem(`Unknown command: ${cmd}`);
+    if (cmd === "/help") {
+      chatLog.addSystem(
+        [
+          "Commands:",
+          "  /model     — switch model",
+          "  /think     — toggle thinking display",
+          "  /clear     — clear conversation",
+          "  /new       — start fresh session",
+          "  /history   — show session stats",
+          "  /quit      — exit",
+          "  /help      — show this list",
+        ].join("\n"),
+      );
+      tui.requestRender();
+      return;
+    }
+
+    chatLog.addSystem(
+      `Unknown command: ${cmd}. Type /help for available commands.`,
+    );
     tui.requestRender();
   };
 
@@ -669,7 +695,7 @@ async function runTui(
 
   editor.onCtrlC = () => {
     if (isBusy) {
-      agent.abort();
+      session.agent.abort();
       setStatusIdle("aborted | ready");
       isBusy = false;
       tui.requestRender();
